@@ -72,4 +72,24 @@ pub trait CryptoService: Send + Sync {
     fn verify_access_token(&self, token: &str) -> Result<AccessTokenClaims, AuthError>;
     fn generate_pre_auth_token(&self, user_id: &str, session_id: &str) -> Result<String, AuthError>;
     fn verify_pre_auth_token(&self, token: &str) -> Result<PreAuthTokenClaims, AuthError>;
+    fn generate_id_token(
+        &self,
+        issuer: &str,
+        client_id: &str,
+        user_id: &str,
+        email: &str,
+        roles: &[String],
+        permissions: &[String],
+    ) -> Result<String, AuthError>;
+}
+
+#[async_trait]
+pub trait OAuthClientRepository: Send + Sync {
+    async fn find_client(&self, client_id: &str) -> Result<Option<crate::domain::entities::OAuthClient>, AuthError>;
+}
+
+#[async_trait]
+pub trait OAuthCodeStore: Send + Sync {
+    async fn save_code(&self, auth_code: &crate::domain::entities::OAuthAuthorizationCode, ttl_seconds: usize) -> Result<(), AuthError>;
+    async fn consume_code(&self, code: &str) -> Result<Option<crate::domain::entities::OAuthAuthorizationCode>, AuthError>;
 }

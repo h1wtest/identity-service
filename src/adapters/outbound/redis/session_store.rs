@@ -21,6 +21,10 @@ impl RedisSessionStore {
 
         Ok(Self { manager })
     }
+
+    pub fn manager(&self) -> ConnectionManager {
+        self.manager.clone()
+    }
 }
 
 #[async_trait]

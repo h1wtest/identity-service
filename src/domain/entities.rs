@@ -98,3 +98,49 @@ pub struct RedisSessionData {
     pub created_at: i64,
     pub last_active_at: i64,
 }
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OAuthClient {
+    pub client_id: String,
+    pub client_secret_hash: Option<String>,
+    pub client_name: String,
+    pub redirect_uris: Vec<String>,
+    pub allowed_scopes: Vec<String>,
+    pub is_public: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OAuthAuthorizationCode {
+    pub code: String,
+    pub client_id: String,
+    pub user_id: String,
+    pub redirect_uri: String,
+    pub scope: String,
+    pub code_challenge: String,
+    pub code_challenge_method: String,
+    pub expires_at: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OidcIdTokenClaims {
+    pub iss: String,
+    pub sub: String,
+    pub aud: String,
+    pub exp: i64,
+    pub iat: i64,
+    pub auth_time: i64,
+    pub email: String,
+    pub email_verified: bool,
+    pub roles: Vec<String>,
+    pub permissions: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OAuthTokenResponse {
+    pub access_token: String,
+    pub token_type: String,
+    pub expires_in: i64,
+    pub refresh_token: Option<String>,
+    pub id_token: Option<String>,
+    pub scope: String,
+}

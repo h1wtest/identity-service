@@ -21,7 +21,10 @@ use adapters::outbound::postgres::outbox_repo::PostgresOutboxRepository;
 use adapters::outbound::postgres::rbac_repo::PostgresRbacRepository;
 use adapters::outbound::postgres::session_repo::PostgresSessionMetadataRepository;
 use adapters::outbound::postgres::user_repo::PostgresUserRepository;
+use adapters::outbound::postgres::oauth_repo::PostgresOAuthClientRepository;
+use adapters::outbound::redis::oauth_code_store::RedisOAuthCodeStore;
 use adapters::outbound::redis::session_store::RedisSessionStore;
+use application::oauth::OAuthUseCase;
 use application::login::LoginUseCase;
 use application::mfa::MfaUseCase;
 use application::register::RegisterUseCase;
@@ -63,6 +66,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let session_metadata_repo = Arc::new(PostgresSessionMetadataRepository::new(db_pool.clone()));
     let mfa_repo = Arc::new(PostgresMfaRepository::new(db_pool.clone()));
     let outbox_repo = Arc::new(PostgresOutboxRepository::new(db_pool.clone()));
+    let client_repo = Arc::new(PostgresOAuthClientRepository::new(db_pool.clone()));
+    let code_store = Arc::new(RedisOAuthCodeStore::new(session_store.manager()));
 
     // 5. Application Use Cases
     let register_use_case = Arc::new(RegisterUseCase::new(
@@ -98,6 +103,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         session_store.clone(),
         session_metadata_repo.clone(),
         outbox_repo.clone(),
+    ));
+
+    let oauth_use_case = Arc::new(OAuthUseCase::new(
+        client_repo.clone(),
+        code_store.clone(),
+        user_repo.clone(),
+        rbac_repo.clone(),
+        session_store.clone(),
+        session_metadata_repo.clone(),
+        crypto.clone(),
+        config.oauth_issuer.clone(),
+        config.refresh_token_ttl_seconds,
     ));
 
     // 6. Background Outbox Relay to Kafka
@@ -145,7 +162,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         login_use_case,
         mfa_use_case,
         sessions_use_case,
+        oauth_use_case,
         crypto,
+        issuer: config.oauth_issuer.clone(),
     };
 
     let router = create_router(app_state);

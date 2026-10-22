@@ -69,6 +69,14 @@ impl DefaultCryptoService {
 
         Ok(totp.get_url())
     }
+
+    pub fn verify_pkce(code_verifier: &str, code_challenge: &str) -> bool {
+        use base64::prelude::*;
+        let mut hasher = Sha256::new();
+        hasher.update(code_verifier.as_bytes());
+        let computed = BASE64_URL_SAFE_NO_PAD.encode(hasher.finalize());
+        computed == code_challenge
+    }
 }
 
 impl CryptoService for DefaultCryptoService {
@@ -180,5 +188,38 @@ impl CryptoService for DefaultCryptoService {
         }
 
         Ok(token_data.claims)
+    }
+
+    fn generate_id_token(
+        &self,
+        issuer: &str,
+        client_id: &str,
+        user_id: &str,
+        email: &str,
+        roles: &[String],
+        permissions: &[String],
+    ) -> Result<String, AuthError> {
+        let now = Utc::now().timestamp();
+        let exp = now + self.access_token_ttl;
+
+        let claims = crate::domain::entities::OidcIdTokenClaims {
+            iss: issuer.to_string(),
+            sub: user_id.to_string(),
+            aud: client_id.to_string(),
+            exp,
+            iat: now,
+            auth_time: now,
+            email: email.to_string(),
+            email_verified: true,
+            roles: roles.to_vec(),
+            permissions: permissions.to_vec(),
+        };
+
+        encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(self.jwt_secret.as_bytes()),
+        )
+        .map_err(|e| AuthError::Internal(format!("Failed to sign OIDC id_token: {}", e)))
     }
 }

@@ -12,6 +12,7 @@ pub struct Config {
     pub access_token_ttl_seconds: i64,
     pub refresh_token_ttl_seconds: i64,
     pub password_reset_token_ttl_seconds: i64,
+    pub oauth_issuer: String,
 }
 
 impl Config {
@@ -58,6 +59,9 @@ impl Config {
             .unwrap_or_else(|_| "900".to_string())
             .parse::<i64>()?;
 
+        let oauth_issuer = env::var("OAUTH_ISSUER")
+            .unwrap_or_else(|_| "http://localhost:8001".to_string());
+
         Ok(Config {
             http_port,
             grpc_port,
@@ -69,6 +73,7 @@ impl Config {
             access_token_ttl_seconds,
             refresh_token_ttl_seconds,
             password_reset_token_ttl_seconds,
+            oauth_issuer,
         })
     }
 }

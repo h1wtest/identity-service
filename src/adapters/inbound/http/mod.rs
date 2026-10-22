@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{delete, get, post},
@@ -16,6 +16,7 @@ use crate::application::login::{LoginCommand, LoginUseCase};
 use crate::application::mfa::{MfaUseCase, VerifyMfaLoginCommand};
 use crate::application::register::{RegisterCommand, RegisterUseCase};
 use crate::application::sessions::SessionsUseCase;
+use crate::application::oauth::OAuthUseCase;
 use crate::domain::errors::AuthError;
 use crate::domain::ports::CryptoService;
 
@@ -25,7 +26,9 @@ pub struct AppState {
     pub login_use_case: Arc<LoginUseCase>,
     pub mfa_use_case: Arc<MfaUseCase>,
     pub sessions_use_case: Arc<SessionsUseCase>,
+    pub oauth_use_case: Arc<OAuthUseCase>,
     pub crypto: Arc<dyn CryptoService>,
+    pub issuer: String,
 }
 
 pub fn create_router(state: AppState) -> Router {
@@ -36,6 +39,11 @@ pub fn create_router(state: AppState) -> Router {
 
     Router::new()
         .route("/health", get(health_check))
+        .route("/.well-known/openid-configuration", get(openid_configuration_handler))
+        .route("/.well-known/jwks.json", get(jwks_handler))
+        .route("/oauth/authorize", get(oauth_authorize_handler))
+        .route("/oauth/token", post(oauth_token_handler))
+        .route("/oauth/userinfo", get(oauth_userinfo_handler))
         .route("/api/v1/auth/register", post(register_handler))
         .route("/api/v1/auth/login", post(login_handler))
         .route("/api/v1/auth/mfa/verify-login", post(verify_mfa_login_handler))
@@ -226,6 +234,127 @@ async fn revoke_all_sessions_handler(
         .revoke_all_sessions(user_id, "user_revoked_all_via_lk")
         .await?;
     Ok((StatusCode::OK, Json(json!({"message": "All sessions revoked", "count": count}))))
+}
+
+async fn openid_configuration_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let issuer = &state.issuer;
+    Json(json!({
+        "issuer": issuer,
+        "authorization_endpoint": format!("{}/oauth/authorize", issuer),
+        "token_endpoint": format!("{}/oauth/token", issuer),
+        "userinfo_endpoint": format!("{}/oauth/userinfo", issuer),
+        "jwks_uri": format!("{}/.well-known/jwks.json", issuer),
+        "response_types_supported": ["code"],
+        "subject_types_supported": ["public"],
+        "id_token_signing_alg_values_supported": ["HS256"],
+        "scopes_supported": ["openid", "profile", "email"],
+        "token_endpoint_auth_methods_supported": ["none", "client_secret_post"],
+        "code_challenge_methods_supported": ["S256"],
+        "grant_types_supported": ["authorization_code", "refresh_token"]
+    }))
+}
+
+async fn jwks_handler() -> impl IntoResponse {
+    Json(json!({
+        "keys": [
+            {
+                "kty": "oct",
+                "alg": "HS256",
+                "use": "sig",
+                "kid": "sso-hmac-key-1"
+            }
+        ]
+    }))
+}
+
+#[derive(Deserialize)]
+struct AuthorizeQuery {
+    client_id: String,
+    redirect_uri: String,
+    response_type: String,
+    scope: Option<String>,
+    code_challenge: String,
+    code_challenge_method: String,
+    state: Option<String>,
+}
+
+async fn oauth_authorize_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthorizeQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    let (user_id, _) = extract_auth(&headers, state.crypto.as_ref())?;
+    let scope = query.scope.unwrap_or_else(|| "openid profile email".to_string());
+
+    let redirect_url = state.oauth_use_case.authorize(
+        user_id,
+        &query.client_id,
+        &query.redirect_uri,
+        &query.response_type,
+        &scope,
+        &query.code_challenge,
+        &query.code_challenge_method,
+        query.state.as_deref(),
+    ).await?;
+
+    Ok((
+        StatusCode::OK,
+        Json(json!({
+            "redirect_url": redirect_url,
+            "status": "authorized"
+        }))
+    ))
+}
+
+#[derive(Deserialize)]
+struct TokenRequest {
+    grant_type: String,
+    client_id: String,
+    code: String,
+    redirect_uri: String,
+    code_verifier: String,
+}
+
+async fn oauth_token_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<TokenRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    if payload.grant_type != "authorization_code" {
+        return Err(AppError(AuthError::Internal(
+            "Unsupported grant_type. Only 'authorization_code' is supported".to_string(),
+        )));
+    }
+
+    let ip_address = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("127.0.0.1");
+
+    let user_agent = headers
+        .get("user-agent")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("OAuth Client");
+
+    let response = state.oauth_use_case.exchange_token(
+        &payload.client_id,
+        &payload.redirect_uri,
+        &payload.code,
+        &payload.code_verifier,
+        ip_address,
+        user_agent,
+    ).await?;
+
+    Ok((StatusCode::OK, Json(response)))
+}
+
+async fn oauth_userinfo_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, AppError> {
+    let (user_id, _) = extract_auth(&headers, state.crypto.as_ref())?;
+    let info = state.oauth_use_case.get_userinfo(user_id).await?;
+    Ok((StatusCode::OK, Json(info)))
 }
 
 // Error adapter for Axum
