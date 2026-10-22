@@ -5,6 +5,7 @@ use redis::AsyncCommands;
 use crate::domain::entities::RedisSessionData;
 use crate::domain::errors::AuthError;
 use crate::domain::ports::SessionStore;
+use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct RedisSessionStore {
@@ -117,5 +118,31 @@ impl SessionStore for RedisSessionStore {
             .map_err(|e| AuthError::CacheError(e.to_string()))?;
 
         Ok(ids)
+    }
+
+    async fn save_verification_code(&self, user_id: Uuid, code: &str, ttl_seconds: usize) -> Result<(), AuthError> {
+        let mut conn = self.manager.clone();
+        let key = format!("verify_email:{}", user_id);
+        conn.set_ex::<_, _, ()>(&key, code, ttl_seconds as u64)
+            .await
+            .map_err(|e| AuthError::CacheError(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn get_verification_code(&self, user_id: Uuid) -> Result<Option<String>, AuthError> {
+        let mut conn = self.manager.clone();
+        let key = format!("verify_email:{}", user_id);
+        let code: Option<String> = conn
+            .get(&key)
+            .await
+            .map_err(|e| AuthError::CacheError(e.to_string()))?;
+        Ok(code)
+    }
+
+    async fn delete_verification_code(&self, user_id: Uuid) -> Result<(), AuthError> {
+        let mut conn = self.manager.clone();
+        let key = format!("verify_email:{}", user_id);
+        let _: Result<(), _> = conn.del(&key).await;
+        Ok(())
     }
 }

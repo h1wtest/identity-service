@@ -107,4 +107,62 @@ impl OutboxRepository for PostgresOutboxRepository {
 
         Ok(())
     }
+
+    async fn lock_next_batch(&self, limit: i64) -> Result<Vec<OutboxEvent>, AuthError> {
+        // Atomic lock and fetch using FOR UPDATE SKIP LOCKED
+        let rows = sqlx::query(
+            r#"
+            WITH locked_events AS (
+                SELECT id
+                FROM outbox_events
+                WHERE is_processed = FALSE
+                ORDER BY created_at ASC
+                LIMIT $1
+                FOR UPDATE SKIP LOCKED
+            )
+            SELECT o.id, o.event_type, o.aggregate_id, o.payload, o.headers,
+                   o.is_processed, o.retry_count, o.last_error, o.created_at
+            FROM outbox_events o
+            JOIN locked_events l ON o.id = l.id;
+            "#,
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let events = rows
+            .into_iter()
+            .map(|r| OutboxEvent {
+                id: r.get("id"),
+                event_type: r.get("event_type"),
+                aggregate_id: r.get("aggregate_id"),
+                payload: r.get("payload"),
+                headers: r.get("headers"),
+                is_processed: r.get("is_processed"),
+                retry_count: r.get("retry_count"),
+                last_error: r.get("last_error"),
+                created_at: r.get("created_at"),
+            })
+            .collect();
+
+        Ok(events)
+    }
+
+    async fn mark_batch_processed(&self, ids: &[Uuid]) -> Result<(), AuthError> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        sqlx::query(
+            r#"
+            UPDATE outbox_events
+            SET is_processed = TRUE, processed_at = NOW()
+            WHERE id = ANY($1)
+            "#,
+        )
+        .bind(ids)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
 }

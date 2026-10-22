@@ -43,7 +43,7 @@ impl OutboxRelayWorker {
     }
 
     async fn process_batch(&self) -> Result<(), anyhow::Error> {
-        let events = self.outbox_repo.fetch_unprocessed(50).await?;
+        let events = self.outbox_repo.lock_next_batch(50).await?;
         if events.is_empty() {
             return Ok(());
         }

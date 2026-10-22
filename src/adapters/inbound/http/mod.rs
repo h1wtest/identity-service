@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use crate::application::login::{LoginCommand, LoginUseCase};
 use crate::application::mfa::{MfaUseCase, VerifyMfaLoginCommand};
-use crate::application::register::{RegisterCommand, RegisterUseCase};
+use crate::application::register::{RegisterCommand, RegisterUseCase, VerifyEmailCommand, VerifyEmailUseCase};
 use crate::application::sessions::SessionsUseCase;
 use crate::application::oauth::OAuthUseCase;
 use crate::domain::errors::AuthError;
@@ -23,6 +23,7 @@ use crate::domain::ports::CryptoService;
 #[derive(Clone)]
 pub struct AppState {
     pub register_use_case: Arc<RegisterUseCase>,
+    pub verify_email_use_case: Arc<VerifyEmailUseCase>,
     pub login_use_case: Arc<LoginUseCase>,
     pub mfa_use_case: Arc<MfaUseCase>,
     pub sessions_use_case: Arc<SessionsUseCase>,
@@ -45,6 +46,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/oauth/token", post(oauth_token_handler))
         .route("/oauth/userinfo", get(oauth_userinfo_handler))
         .route("/api/v1/auth/register", post(register_handler))
+        .route("/api/v1/auth/verify-email", post(verify_email_handler))
         .route("/api/v1/auth/login", post(login_handler))
         .route("/api/v1/auth/mfa/verify-login", post(verify_mfa_login_handler))
         .route("/api/v1/auth/mfa/setup", post(setup_mfa_handler))
@@ -78,6 +80,25 @@ async fn register_handler(
 
     let result = state.register_use_case.execute(cmd).await?;
     Ok((StatusCode::CREATED, Json(result)))
+}
+
+#[derive(Deserialize)]
+struct VerifyEmailRequest {
+    user_id: Uuid,
+    code: String,
+}
+
+async fn verify_email_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<VerifyEmailRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let cmd = VerifyEmailCommand {
+        user_id: payload.user_id,
+        code: payload.code,
+    };
+
+    let result = state.verify_email_use_case.execute(cmd).await?;
+    Ok((StatusCode::OK, Json(result)))
 }
 
 #[derive(Deserialize)]
@@ -369,21 +390,27 @@ impl From<AuthError> for AppError {
 impl IntoResponse for AppError {
     fn into_response(self) -> axum::response::Response {
         let (status, err_msg) = match &self.0 {
-            AuthError::UserAlreadyExists(msg) => (StatusCode::CONFLICT, msg.clone()),
-            AuthError::InvalidCredentials => (StatusCode::UNAUTHORIZED, "Invalid email or password".to_string()),
-            AuthError::AccountBanned(reason) => (StatusCode::FORBIDDEN, format!("Account banned: {}", reason)),
-            AuthError::InvalidMfaCode => (StatusCode::BAD_REQUEST, "Invalid MFA verification code".to_string()),
-            AuthError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, msg.clone()),
-            AuthError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg.clone()),
-            AuthError::InvalidToken => (StatusCode::UNAUTHORIZED, "Invalid or expired token".to_string()),
-            AuthError::UserNotFound => (StatusCode::NOT_FOUND, "User not found".to_string()),
-            _ => (StatusCode::INTERNAL_SERVER_ERROR, self.0.to_string()),
+            AuthError::UserAlreadyExists(msg) => (StatusCode::CONFLICT, json!({ "error": msg })),
+            AuthError::EmailNotVerified { user_id, email } => (
+                StatusCode::FORBIDDEN,
+                json!({
+                    "error": "Email address is not verified",
+                    "code": "email_not_verified",
+                    "user_id": user_id,
+                    "email": email
+                }),
+            ),
+            AuthError::InvalidVerificationCode => (StatusCode::BAD_REQUEST, json!({ "error": "Invalid or expired email verification code" })),
+            AuthError::InvalidCredentials => (StatusCode::UNAUTHORIZED, json!({ "error": "Invalid email or password" })),
+            AuthError::AccountBanned(reason) => (StatusCode::FORBIDDEN, json!({ "error": format!("Account banned: {}", reason) })),
+            AuthError::InvalidMfaCode => (StatusCode::BAD_REQUEST, json!({ "error": "Invalid MFA verification code" })),
+            AuthError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, json!({ "error": msg })),
+            AuthError::Forbidden(msg) => (StatusCode::FORBIDDEN, json!({ "error": msg })),
+            AuthError::InvalidToken => (StatusCode::UNAUTHORIZED, json!({ "error": "Invalid or expired token" })),
+            AuthError::UserNotFound => (StatusCode::NOT_FOUND, json!({ "error": "User not found" })),
+            _ => (StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": self.0.to_string() })),
         };
 
-        let body = Json(json!({
-            "error": err_msg,
-        }));
-
-        (status, body).into_response()
+        (status, Json(err_msg)).into_response()
     }
 }

@@ -90,6 +90,13 @@ impl LoginUseCase {
             return Err(AuthError::InvalidCredentials);
         }
 
+        if !user.is_verified {
+            return Err(AuthError::EmailNotVerified {
+                user_id: user.id,
+                email: user.email.clone(),
+            });
+        }
+
         let session_id = Uuid::now_v7();
         let user_id_str = user.id.to_string();
         let session_id_str = session_id.to_string();

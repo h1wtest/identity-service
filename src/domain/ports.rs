@@ -30,6 +30,9 @@ pub trait SessionStore: Send + Sync {
     async fn delete_session(&self, session_id: &str) -> Result<(), AuthError>;
     async fn delete_user_sessions(&self, user_id: &str) -> Result<u32, AuthError>;
     async fn get_user_session_ids(&self, user_id: &str) -> Result<Vec<String>, AuthError>;
+    async fn save_verification_code(&self, user_id: Uuid, code: &str, ttl_seconds: usize) -> Result<(), AuthError>;
+    async fn get_verification_code(&self, user_id: Uuid) -> Result<Option<String>, AuthError>;
+    async fn delete_verification_code(&self, user_id: Uuid) -> Result<(), AuthError>;
 }
 
 #[async_trait]
@@ -46,8 +49,9 @@ pub trait OutboxRepository: Send + Sync {
     async fn fetch_unprocessed(&self, limit: i64) -> Result<Vec<OutboxEvent>, AuthError>;
     async fn mark_processed(&self, id: Uuid) -> Result<(), AuthError>;
     async fn record_failure(&self, id: Uuid, err: &str) -> Result<(), AuthError>;
+    async fn lock_next_batch(&self, limit: i64) -> Result<Vec<OutboxEvent>, AuthError>;
+    async fn mark_batch_processed(&self, ids: &[Uuid]) -> Result<(), AuthError>;
 }
-
 #[async_trait]
 pub trait MfaRepository: Send + Sync {
     async fn save_secret(&self, user_id: Uuid, secret: &str) -> Result<(), AuthError>;

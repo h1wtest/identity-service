@@ -27,7 +27,7 @@ use adapters::outbound::redis::session_store::RedisSessionStore;
 use application::oauth::OAuthUseCase;
 use application::login::LoginUseCase;
 use application::mfa::MfaUseCase;
-use application::register::RegisterUseCase;
+use application::register::{RegisterUseCase, VerifyEmailUseCase};
 use application::sessions::SessionsUseCase;
 use config::Config;
 use proto::identity::v1::identity_service_server::IdentityServiceServer;
@@ -73,8 +73,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let register_use_case = Arc::new(RegisterUseCase::new(
         user_repo.clone(),
         rbac_repo.clone(),
+        session_store.clone(),
         outbox_repo.clone(),
         crypto.clone(),
+    ));
+
+    let verify_email_use_case = Arc::new(VerifyEmailUseCase::new(
+        user_repo.clone(),
+        session_store.clone(),
     ));
 
     let login_use_case = Arc::new(LoginUseCase::new(
@@ -159,6 +165,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 8. Axum HTTP Server
     let app_state = AppState {
         register_use_case,
+        verify_email_use_case,
         login_use_case,
         mfa_use_case,
         sessions_use_case,

@@ -14,6 +14,12 @@ pub enum AuthError {
     #[error("Account is banned: {0}")]
     AccountBanned(String),
 
+    #[error("Email address is not verified")]
+    EmailNotVerified { user_id: uuid::Uuid, email: String },
+
+    #[error("Invalid or expired email verification code")]
+    InvalidVerificationCode,
+
     #[error("MFA verification is required")]
     MfaRequired { pre_auth_token: String },
 
