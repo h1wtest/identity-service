@@ -1,48 +1,45 @@
 [package]
 name = "identity-service"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
+rust-version = "1.99"
 
 [dependencies]
-# Async Runtime & HTTP Server
 tokio = { version = "1.43", features = ["full"] }
-axum = { version = "0.8", features = ["macros"] }
+axum = { version = "0.8", features = ["macros", "form"] }
+axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
 tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["trace", "limit"] }
+rskafka = { version = "0.6", features = ["transport-tls"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = { version = "1.13", features = ["std"] }
 async-trait = "0.1"
-tower-http = { version = "0.6", features = ["cors", "trace"] }
-
-# gRPC & Protobuf
-tonic = "0.12"
-prost = "0.13"
-prost-types = "0.13"
-
-# Kafka Producer (Pure Rust async client)
-rskafka = "0.6"
-sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "migrate"] }
-redis = { version = "0.28", features = ["tokio-comp", "connection-manager"] }
-
-# Security & Cryptography
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "postgres", "macros", "uuid", "chrono", "migrate", "json"] }
 argon2 = "0.5"
-jsonwebtoken = "9.3"
-totp-rs = { version = "5.6", features = ["gen_secret", "qr"] }
+jsonwebtoken = { version = "10.3", default-features = false, features = ["aws_lc_rs", "use_pem"] }
+aes-gcm = "0.10"
+subtle = "2.6"
+totp-rs = { version = "5.6", features = ["gen_secret", "otpauth"] }
+ring = "0.17"
+pem = "3"
+pkcs1 = { version = "0.7", features = ["std"] }
+spki = { version = "0.7", features = ["std"] }
 rand = "0.8"
 sha2 = "0.10"
 base64 = "0.22"
-
-# Serialization & Identifiers
+url = "2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 uuid = { version = "1.13", features = ["v4", "v7", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
-
-# Observability & Diagnostics
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-
-# Error Handling & Config
+tracing-opentelemetry = "0.33"
+opentelemetry = "0.32"
+opentelemetry_sdk = { version = "0.32.1", features = ["rt-tokio", "experimental_trace_batch_span_processor_with_async_runtime"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["http-proto", "reqwest-client", "reqwest-rustls-webpki-roots", "trace"] }
+prometheus = { version = "0.14", default-features = false }
 thiserror = "2.0"
 anyhow = "1.0"
 dotenvy = "0.15"
-
-[build-dependencies]
-tonic-build = "0.12"
+platform-contracts = { path = "../platform-contracts/rust" }
