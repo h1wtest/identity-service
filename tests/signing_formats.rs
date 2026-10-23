@@ -300,3 +300,27 @@ async fn kafka_ca_rejects_empty_malformed_and_invalid_certificates_before_connec
     };
     assert!(error.downcast_ref::<rustls::Error>().is_some());
 }
+
+#[test]
+#[ignore = "requires full identity env and actual OpenSSL fixture CLI"]
+fn correctly_signed_tokens_with_malformed_expiry_are_rejected() {
+    let keys = Keys::new();
+    keys.rsa("active.pem", "2048");
+    let config = config(&keys.path("active.pem"), "active");
+    let crypto = Crypto::new(&config).unwrap();
+    let claims = claims(&config);
+    assert!(crypto.verify(&crypto.sign(&claims).unwrap()).is_ok());
+    for expiry in [
+        serde_json::json!("99999999999"),
+        serde_json::json!(null),
+        serde_json::json!(true),
+        serde_json::json!([]),
+        serde_json::json!({}),
+        serde_json::json!(-1),
+    ] {
+        let mut malformed = serde_json::to_value(&claims).unwrap();
+        malformed["exp"] = expiry;
+        let token = crypto.sign(&malformed).unwrap();
+        assert!(crypto.verify(&token).is_err());
+    }
+}

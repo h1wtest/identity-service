@@ -245,7 +245,8 @@ async fn observe(State(state): State<AppState>, mut request: Request, next: Next
     });
     let span =
         tracing::info_span!("http.request",http.method=%method,http.route=%path,otel.kind="server");
-    span.set_parent(parent);
+    // No OpenTelemetry layer is installed when OTLP export is disabled.
+    let _ = span.set_parent(parent);
     let ctx = span.context();
     let sc = ctx.span().span_context().clone();
     let traceparent = if sc.is_valid() {

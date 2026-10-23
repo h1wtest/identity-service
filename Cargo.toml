@@ -16,7 +16,7 @@ rustls-pki-types = { version = "1.13", features = ["std"] }
 async-trait = "0.1"
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "postgres", "macros", "uuid", "chrono", "migrate", "json"] }
 argon2 = "0.5"
-jsonwebtoken = "9.3"
+jsonwebtoken = { version = "10.3", default-features = false, features = ["aws_lc_rs", "use_pem"] }
 aes-gcm = "0.10"
 subtle = "2.6"
 totp-rs = { version = "5.6", features = ["gen_secret", "otpauth"] }
@@ -34,10 +34,10 @@ uuid = { version = "1.13", features = ["v4", "v7", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-tracing-opentelemetry = "0.28"
-opentelemetry = "0.27"
-opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.27", features = ["http-proto", "reqwest-client"] }
+tracing-opentelemetry = "0.33"
+opentelemetry = "0.32"
+opentelemetry_sdk = { version = "0.32.1", features = ["rt-tokio", "experimental_trace_batch_span_processor_with_async_runtime"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["http-proto", "reqwest-client", "reqwest-rustls-webpki-roots", "trace"] }
 prometheus = { version = "0.14", default-features = false }
 thiserror = "2.0"
 anyhow = "1.0"
