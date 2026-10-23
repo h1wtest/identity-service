@@ -748,21 +748,29 @@ async fn expired_consumed_code_with_bound_proof_revokes_live_family_and_session(
     let reason: Option<String> = sqlx::query_scalar("SELECT revoked_reason FROM oauth_token_families WHERE session_id=$1 AND revoked_at IS NOT NULL")
         .bind(f.sid).fetch_one(&f.state.db).await.unwrap();
     assert_eq!(reason.as_deref(), Some("oauth_code_reuse"));
-    let session: (bool, Option<String>) = sqlx::query_as("SELECT is_active,revoked_reason FROM sessions WHERE id=$1")
-        .bind(f.sid).fetch_one(&f.state.db).await.unwrap();
+    let session: (bool, Option<String>) =
+        sqlx::query_as("SELECT is_active,revoked_reason FROM sessions WHERE id=$1")
+            .bind(f.sid)
+            .fetch_one(&f.state.db)
+            .await
+            .unwrap();
     assert!(!session.0);
     assert_eq!(session.1.as_deref(), Some("oauth_code_reuse"));
     let envelopes: Vec<Value> = sqlx::query_scalar("SELECT payload FROM outbox_events WHERE aggregate_id=$1 AND event_type='identity.session_revoked'")
         .bind(f.uid.to_string()).fetch_all(&f.state.db).await.unwrap();
     assert_eq!(envelopes.len(), 1);
-    let envelope: platform_contracts::Envelope = serde_json::from_value(envelopes[0].clone()).unwrap();
+    let envelope: platform_contracts::Envelope =
+        serde_json::from_value(envelopes[0].clone()).unwrap();
     envelope.validate().unwrap();
     assert_eq!(envelope.aggregate_id, f.uid);
-    assert_eq!(envelope.payload.unwrap(), json!({
-        "user_id": f.uid,
-        "session_id": f.sid,
-        "reason": "oauth_code_reuse"
-    }));
+    assert_eq!(
+        envelope.payload.unwrap(),
+        json!({
+            "user_id": f.uid,
+            "session_id": f.sid,
+            "reason": "oauth_code_reuse"
+        })
+    );
     assert_eq!(
         f.userinfo(tokens["access_token"].as_str().unwrap()).await.0,
         StatusCode::UNAUTHORIZED

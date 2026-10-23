@@ -106,9 +106,14 @@ async fn revoked_actor_cannot_revoke_after_waiting(revoke_all: bool) {
 
     let mut blocker = state.db.begin().await.unwrap();
     let blocker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-        .fetch_one(&mut *blocker).await.unwrap();
+        .fetch_one(&mut *blocker)
+        .await
+        .unwrap();
     sqlx::query("SELECT id FROM users WHERE id=$1 FOR UPDATE")
-        .bind(uid).execute(&mut *blocker).await.unwrap();
+        .bind(uid)
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
     let path = if revoke_all {
         "/api/v1/auth/sessions".to_owned()
     } else {
@@ -120,37 +125,59 @@ async fn revoked_actor_cannot_revoke_after_waiting(revoke_all: bool) {
         .header("origin", &state.config.public_origin)
         .header("cookie", format!("sso_session={token}; sso_csrf={csrf}"))
         .header("x-csrf-token", &csrf)
-        .body(Body::empty()).unwrap();
+        .body(Body::empty())
+        .unwrap();
     let app = identity_service::create_router(state.clone());
     let attempt = tokio::spawn(async move { app.oneshot(request).await.unwrap() });
     // The database lock graph proves the HTTP request passed initial authentication
     // and reached the mutation transaction; no elapsed-time guess controls this race.
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
-            let waiting: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid)))")
-                .bind(blocker_pid).fetch_one(&state.db).await.unwrap();
+            let waiting: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid)))",
+            )
+            .bind(blocker_pid)
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
             if waiting {
                 break;
             }
             tokio::task::yield_now().await;
         }
-    }).await.expect("revocation request must wait for the locked user");
+    })
+    .await
+    .expect("revocation request must wait for the locked user");
     sqlx::query("UPDATE sessions SET is_active=false WHERE id=$1")
-        .bind(actor_sid).execute(&mut *blocker).await.unwrap();
+        .bind(actor_sid)
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
     if revoke_all {
         sqlx::query("INSERT INTO sessions(id,user_id,ip_address,user_agent,cookie_hash,expires_at) VALUES($1,$2,'127.0.0.1','replacement-race',$3,now()+interval '1 day')")
             .bind(target_sid).bind(uid).bind(digest(&random_token())).execute(&mut *blocker).await.unwrap();
     }
     blocker.commit().await.unwrap();
     let response = tokio::time::timeout(std::time::Duration::from_secs(5), attempt)
-        .await.unwrap().unwrap();
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     let target_active: bool = sqlx::query_scalar("SELECT is_active FROM sessions WHERE id=$1")
-        .bind(target_sid).fetch_one(&state.db).await.unwrap();
-    assert!(target_active, "revoked actor must not revoke the target session");
+        .bind(target_sid)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert!(
+        target_active,
+        "revoked actor must not revoke the target session"
+    );
     let events: i64 = sqlx::query_scalar("SELECT count(*) FROM outbox_events WHERE aggregate_id=$1 AND event_type='identity.session_revoked'")
         .bind(uid.to_string()).fetch_one(&state.db).await.unwrap();
-    assert_eq!(events, 0, "denied revocation must not enqueue a mutation event");
+    assert_eq!(
+        events, 0,
+        "denied revocation must not enqueue a mutation event"
+    );
 }
 
 #[tokio::test]
