@@ -1,0 +1,133 @@
+name: Verify identity
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      contracts_revision:
+        description: Immutable platform-contracts commit (40 lowercase hex)
+        required: false
+        type: string
+permissions:
+  contents: read
+jobs:
+  identity:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      RUSTUP_TOOLCHAIN: 1.99.0
+      CONTRACTS_REVISION: ${{ inputs.contracts_revision || vars.PLATFORM_CONTRACTS_REVISION }}
+    services:
+      postgres:
+        image: postgres:18.6-bookworm@sha256:bbf83594798e144bff365a9c191c5d779f181fb3135902064ab8ff11918020fc
+        env:
+          POSTGRES_USER: identity
+          POSTGRES_PASSWORD: disposable-ci-only
+          POSTGRES_DB: identity_test
+        ports: ["5432:5432"]
+        options: --health-cmd "pg_isready -U identity -d identity_test" --health-interval 5s --health-timeout 3s --health-retries 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          path: identity-service
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require immutable contracts revision
+        run: |
+          if [[ ! "$CONTRACTS_REVISION" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "PLATFORM_CONTRACTS_REVISION must be an explicit immutable commit" >&2
+            exit 1
+          fi
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: h1wtest/platform-contracts
+          ref: ${{ env.CONTRACTS_REVISION }}
+          path: platform-contracts
+          persist-credentials: false
+      - name: Scan service history and pinned contracts for secrets
+        run: |
+          docker run --rm -v "$PWD/identity-service:/repo:ro" zricethezav/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f git /repo --no-banner --redact
+          docker run --rm -v "$PWD/platform-contracts:/repo:ro" zricethezav/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f dir /repo --no-banner --redact
+      - name: Record immutable source provenance
+        run: |
+          test "$(git -C platform-contracts rev-parse HEAD)" = "$CONTRACTS_REVISION"
+          printf 'identity_revision=%s\ncontracts_revision=%s\n' "$GITHUB_SHA" "$CONTRACTS_REVISION" >> "$GITHUB_STEP_SUMMARY"
+      - name: Install pinned toolchain
+        run: rustup toolchain install 1.99.0 --profile minimal --component rustfmt,clippy
+      - name: Generate disposable credentials
+        shell: bash
+        run: |
+          umask 077
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$RUNNER_TEMP/signing.pem"
+          openssl req -x509 -newkey rsa:2048 -nodes -keyout "$RUNNER_TEMP/tls.key" -out "$RUNNER_TEMP/tls.crt" -subj /CN=localhost -days 1
+          echo "SIGNING_KEY_FILE=$RUNNER_TEMP/signing.pem" >> "$GITHUB_ENV"
+          echo "TLS_CERT_FILE=$RUNNER_TEMP/tls.crt" >> "$GITHUB_ENV"
+          echo "TLS_KEY_FILE=$RUNNER_TEMP/tls.key" >> "$GITHUB_ENV"
+          for key in MFA_ENCRYPTION_KEY DELIVERY_ENCRYPTION_KEY GATEWAY_INTERNAL_TOKEN PROFILE_INTERNAL_TOKEN NOTIFICATION_INTERNAL_TOKEN ADMIN_INTERNAL_TOKEN; do
+            case "$key" in
+              *_ENCRYPTION_KEY) value=$(openssl rand -base64 32) ;;
+              *) value=$(openssl rand -hex 32) ;;
+            esac
+            printf '::add-mask::%s\n' "$value"
+            printf '%s=%s\n' "$key" "$value" >> "$GITHUB_ENV"
+          done
+      - name: Start actual TLS SCRAM broker
+        run: bash identity-service/scripts/ci-broker.sh
+      - name: Create isolated outbox relay and empty databases
+        env:
+          PGPASSWORD: disposable-ci-only
+        run: |
+          for database in identity_outbox identity_relay identity_empty; do
+            psql -h localhost -U identity -d identity_test -v ON_ERROR_STOP=1 -c "CREATE DATABASE $database"
+          done
+      - name: Format, lint and real database regressions
+        working-directory: identity-service
+        env:
+          DATABASE_URL: postgres://identity:disposable-ci-only@localhost:5432/identity_test
+          TEST_DATABASE_URL: postgres://identity:disposable-ci-only@localhost:5432/identity_test
+          PUBLIC_ORIGIN: https://localhost:8448
+          OAUTH_ISSUER: https://localhost:8448
+          SIGNING_KID: ci-rsa
+          RUST_LOG: warn
+        run: |
+          cargo fmt --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked
+          cargo test --locked --test auth_security --test oauth_security --test mfa_password --test authorization_race --test mfa_migration --test rekey --test signing --test signing_formats -- --include-ignored --test-threads=1
+          TEST_DATABASE_URL=postgres://identity:disposable-ci-only@localhost:5432/identity_outbox cargo test --locked --test outbox_security -- --include-ignored --test-threads=1 --skip relay_publishes_canonical_key_trace_and_aggregate_order_to_real_kafka
+          TEST_DATABASE_URL=postgres://identity:disposable-ci-only@localhost:5432/identity_relay cargo test --locked --test outbox_security relay_publishes_canonical_key_trace_and_aggregate_order_to_real_kafka -- --include-ignored --test-threads=1
+          TEST_EMPTY_DATABASE_URL=postgres://identity:disposable-ci-only@localhost:5432/identity_empty cargo test --locked --test readiness -- --include-ignored
+      - name: Dependency audit
+        run: |
+          cargo install cargo-audit --version 0.22.0 --locked
+          cargo audit --file identity-service/Cargo.lock
+      - name: Build immutable service container without publishing
+        run: docker build -f identity-service/Dockerfile --label "org.opencontainers.image.revision=$GITHUB_SHA" --label "platform.contracts.revision=$CONTRACTS_REVISION" -t "identity-service:$GITHUB_SHA" .
+      - name: Scan actual final image at all severities
+        env:
+          TRIVY: docker.io/aquasec/trivy:0.76.1@sha256:790fd66d1697395d8693d1acaa1ea702406a20f109b6fc7bac8db623eca6c06c
+        run: |
+          umask 077
+          image_id=$(docker image inspect "identity-service:$GITHUB_SHA" --format '{{.Id}}')
+          docker image save "$image_id" --output "$RUNNER_TEMP/identity-image.tar"
+          docker run --rm -v "$RUNNER_TEMP:/reports" "$TRIVY" image --input /reports/identity-image.tar --scanners vuln --format json --output /reports/identity-vulnerabilities.json --exit-code 1
+          IMAGE_ID="$image_id" python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          report = json.loads((Path(os.environ['RUNNER_TEMP']) / 'identity-vulnerabilities.json').read_text())
+          if report.get('Metadata', {}).get('ImageID') != os.environ['IMAGE_ID']:
+              raise SystemExit('Scanned image differs from the built immutable image ID')
+          packages = sum(len(entry.get('Packages', [])) for entry in report.get('Results', []) if entry.get('Class') in ('os-pkgs', 'lang-pkgs'))
+          if not packages:
+              raise SystemExit('Final image scan evaluated zero packages; not a clean result')
+          print(f'Final image evaluated packages={packages}; zero vulnerabilities across all severities')
+          PY
+      - name: Remove disposable credentials and broker
+        if: always()
+        run: |
+          if docker container inspect identity-ci-kafka >/dev/null 2>&1; then
+            docker rm -fv identity-ci-kafka
+          fi
+          rm -rf "$RUNNER_TEMP/identity-kafka" "$RUNNER_TEMP/signing.pem" "$RUNNER_TEMP/tls.key" "$RUNNER_TEMP/tls.crt"
+          rm -f "$RUNNER_TEMP/identity-image.tar" "$RUNNER_TEMP/identity-vulnerabilities.json"

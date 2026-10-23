@@ -1,0 +1,13 @@
+**
+!identity-service/
+!identity-service/**
+!platform-contracts/
+!platform-contracts/rust/
+!platform-contracts/rust/**
+**/.git
+**/.env
+**/.env.*
+**/target
+**/*.pem
+**/*.key
+**/*.crt

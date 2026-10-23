@@ -1,79 +1,122 @@
-use std::env;
+use anyhow::{bail, Context, Result};
+use base64::{engine::general_purpose::STANDARD, Engine};
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Config {
-    pub http_port: u16,
-    pub grpc_port: u16,
     pub database_url: String,
-    pub redis_url: String,
+    pub public_origin: String,
+    pub issuer: String,
+    pub signing_key_file: String,
+    pub signing_kid: String,
+    pub previous_signing_public_key_file: Option<String>,
+    pub previous_signing_kid: Option<String>,
+    pub mfa_encryption_key: [u8; 32],
+    pub delivery_encryption_key: [u8; 32],
+    pub http_port: u16,
+    pub session_ttl_seconds: i64,
     pub kafka_brokers: Vec<String>,
-    pub kafka_identity_topic: String,
-    pub jwt_secret: String,
-    pub access_token_ttl_seconds: i64,
-    pub refresh_token_ttl_seconds: i64,
-    pub password_reset_token_ttl_seconds: i64,
-    pub oauth_issuer: String,
+    pub kafka_tls_ca_file: String,
+    pub kafka_sasl_username: String,
+    pub kafka_sasl_password: String,
+    pub tls_cert_file: String,
+    pub tls_key_file: String,
+    pub profile_internal_token: String,
+    pub notification_internal_token: String,
+    pub admin_internal_token: String,
+    pub gateway_internal_token: String,
 }
-
 impl Config {
-    pub fn from_env() -> Result<Self, anyhow::Error> {
-        let _ = dotenvy::dotenv();
-
-        let http_port = env::var("HTTP_PORT")
-            .unwrap_or_else(|_| "8001".to_string())
-            .parse::<u16>()?;
-
-        let grpc_port = env::var("GRPC_PORT")
-            .unwrap_or_else(|_| "50051".to_string())
-            .parse::<u16>()?;
-
-        let database_url = env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://postgres:postgres_secret_pass@localhost:5432/identity_db".to_string());
-
-        let redis_url = env::var("REDIS_URL")
-            .unwrap_or_else(|_| "redis://:redis_secret_pass@localhost:6379/0".to_string());
-
-        let kafka_brokers_str = env::var("KAFKA_BROKERS")
-            .unwrap_or_else(|_| "localhost:9092".to_string());
-        let kafka_brokers = kafka_brokers_str
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-
-        let kafka_identity_topic = env::var("KAFKA_IDENTITY_TOPIC")
-            .unwrap_or_else(|_| "identity.events".to_string());
-
-        let jwt_secret = env::var("JWT_SECRET")
-            .unwrap_or_else(|_| "super_secret_jwt_hmac_key_min_32_bytes_long_here_12345".to_string());
-
-        let access_token_ttl_seconds = env::var("ACCESS_TOKEN_TTL_SECONDS")
-            .unwrap_or_else(|_| "900".to_string())
-            .parse::<i64>()?;
-
-        let refresh_token_ttl_seconds = env::var("REFRESH_TOKEN_TTL_SECONDS")
-            .unwrap_or_else(|_| "604800".to_string())
-            .parse::<i64>()?;
-
-        let password_reset_token_ttl_seconds = env::var("PASSWORD_RESET_TOKEN_TTL_SECONDS")
-            .unwrap_or_else(|_| "900".to_string())
-            .parse::<i64>()?;
-
-        let oauth_issuer = env::var("OAUTH_ISSUER")
-            .unwrap_or_else(|_| "http://localhost:8001".to_string());
-
-        Ok(Config {
-            http_port,
-            grpc_port,
-            database_url,
-            redis_url,
-            kafka_brokers,
-            kafka_identity_topic,
-            jwt_secret,
-            access_token_ttl_seconds,
-            refresh_token_ttl_seconds,
-            password_reset_token_ttl_seconds,
-            oauth_issuer,
+    pub fn from_env() -> Result<Self> {
+        let required = |name: &str| -> Result<String> {
+            let value = std::env::var(name).with_context(|| format!("{name} required"))?;
+            if value.is_empty() {
+                bail!("{name} must not be empty");
+            }
+            Ok(value)
+        };
+        let public_origin = required("PUBLIC_ORIGIN")?;
+        let origin = url::Url::parse(&public_origin)?;
+        if origin.scheme() != "https"
+            || origin.host_str().is_none()
+            || origin.path() != "/"
+            || origin.query().is_some()
+            || origin.fragment().is_some()
+            || !origin.username().is_empty()
+        {
+            bail!("PUBLIC_ORIGIN must be an HTTPS origin");
+        }
+        let issuer = std::env::var("OAUTH_ISSUER").unwrap_or_else(|_| public_origin.clone());
+        if !issuer.starts_with("https://") {
+            bail!("OAUTH_ISSUER must use HTTPS");
+        }
+        let parse_key = |name: &str| -> Result<[u8; 32]> {
+            STANDARD
+                .decode(required(name)?)?
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("{name} must encode 32 bytes"))
+        };
+        let mfa_encryption_key = parse_key("MFA_ENCRYPTION_KEY")?;
+        let delivery_encryption_key = parse_key("DELIVERY_ENCRYPTION_KEY")?;
+        if mfa_encryption_key == delivery_encryption_key {
+            bail!("MFA and delivery encryption keys must be distinct");
+        }
+        let profile_internal_token = required("PROFILE_INTERNAL_TOKEN")?;
+        let notification_internal_token = required("NOTIFICATION_INTERNAL_TOKEN")?;
+        let admin_internal_token = required("ADMIN_INTERNAL_TOKEN")?;
+        for token in [
+            &profile_internal_token,
+            &notification_internal_token,
+            &admin_internal_token,
+        ] {
+            if token.len() < 32 {
+                bail!("internal tokens must be at least 32 characters");
+            }
+        }
+        if profile_internal_token == notification_internal_token
+            || profile_internal_token == admin_internal_token
+            || notification_internal_token == admin_internal_token
+        {
+            bail!("service credentials must be distinct");
+        }
+        let gateway_internal_token = required("GATEWAY_INTERNAL_TOKEN")?;
+        if gateway_internal_token.len() < 32
+            || [
+                &profile_internal_token,
+                &notification_internal_token,
+                &admin_internal_token,
+            ]
+            .contains(&&gateway_internal_token)
+        {
+            bail!("gateway credential must be distinct and at least 32 characters");
+        }
+        Ok(Self {
+            database_url: required("DATABASE_URL")?,
+            public_origin: public_origin.trim_end_matches('/').into(),
+            issuer: issuer.trim_end_matches('/').into(),
+            signing_key_file: required("SIGNING_KEY_FILE")?,
+            signing_kid: required("SIGNING_KID")?,
+            previous_signing_public_key_file: std::env::var("PREVIOUS_SIGNING_PUBLIC_KEY_FILE")
+                .ok(),
+            previous_signing_kid: std::env::var("PREVIOUS_SIGNING_KID").ok(),
+            mfa_encryption_key,
+            delivery_encryption_key,
+            http_port: std::env::var("HTTP_PORT")
+                .unwrap_or_else(|_| "8001".into())
+                .parse()?,
+            session_ttl_seconds: 86400,
+            kafka_brokers: required("KAFKA_BROKERS")?
+                .split(',')
+                .map(str::to_owned)
+                .collect(),
+            kafka_tls_ca_file: required("KAFKA_TLS_CA_FILE")?,
+            kafka_sasl_username: required("KAFKA_SASL_USERNAME")?,
+            kafka_sasl_password: required("KAFKA_SASL_PASSWORD")?,
+            tls_cert_file: required("TLS_CERT_FILE")?,
+            tls_key_file: required("TLS_KEY_FILE")?,
+            profile_internal_token,
+            notification_internal_token,
+            admin_internal_token,
+            gateway_internal_token,
         })
     }
 }

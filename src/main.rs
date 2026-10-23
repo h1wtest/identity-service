@@ -1,214 +1,135 @@
-use std::net::SocketAddr;
-use std::sync::Arc;
-use sqlx::postgres::PgPoolOptions;
-use tokio::net::TcpListener;
-use tokio::signal;
-use tracing::{error, info};
-
-mod adapters;
-mod application;
-mod config;
-mod domain;
-mod proto;
-mod telemetry;
-
-use adapters::inbound::grpc::GrpcIdentityService;
-use adapters::inbound::http::{create_router, AppState};
-use adapters::outbound::crypto::DefaultCryptoService;
-use adapters::outbound::kafka::outbox_relay::OutboxRelayWorker;
-use adapters::outbound::postgres::mfa_repo::PostgresMfaRepository;
-use adapters::outbound::postgres::outbox_repo::PostgresOutboxRepository;
-use adapters::outbound::postgres::rbac_repo::PostgresRbacRepository;
-use adapters::outbound::postgres::session_repo::PostgresSessionMetadataRepository;
-use adapters::outbound::postgres::user_repo::PostgresUserRepository;
-use adapters::outbound::postgres::oauth_repo::PostgresOAuthClientRepository;
-use adapters::outbound::redis::oauth_code_store::RedisOAuthCodeStore;
-use adapters::outbound::redis::session_store::RedisSessionStore;
-use application::oauth::OAuthUseCase;
-use application::login::LoginUseCase;
-use application::mfa::MfaUseCase;
-use application::register::{RegisterUseCase, VerifyEmailUseCase};
-use application::sessions::SessionsUseCase;
-use config::Config;
-use proto::identity::v1::identity_service_server::IdentityServiceServer;
+use identity_service::{auth, config::Config, AppState};
+use sqlx::{postgres::PgPoolOptions, Row};
+use uuid::Uuid;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    telemetry::init_telemetry();
-
-    info!("Starting identity-service...");
-
+async fn main() -> anyhow::Result<()> {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .map_err(|_| anyhow::anyhow!("TLS crypto provider initialization failed"))?;
+    dotenvy::dotenv().ok();
+    let telemetry = identity_service::telemetry::init_telemetry()?;
+    let command = std::env::args().nth(1).unwrap_or_else(|| "serve".into());
+    if command == "rekey" {
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&std::env::var("DATABASE_URL")?)
+            .await?;
+        identity_service::rekey::run(
+            &pool,
+            identity_service::rekey::key_from_env("LEGACY_ENCRYPTION_KEY")?,
+            identity_service::rekey::key_from_env("MFA_ENCRYPTION_KEY")?,
+            identity_service::rekey::key_from_env("DELIVERY_ENCRYPTION_KEY")?,
+        )
+        .await?;
+        tracing::info!("identity purpose-key migration completed");
+        return Ok(());
+    }
+    if command == "migrate" {
+        let db = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&std::env::var("DATABASE_URL")?)
+            .await?;
+        identity_service::migrate(&db).await?;
+        tracing::info!("identity migrations applied");
+        return Ok(());
+    }
+    if command != "serve" && command != "bootstrap-admin" {
+        anyhow::bail!("usage: identity-service [serve|migrate|rekey|bootstrap-admin]");
+    }
     let config = Config::from_env()?;
-
-    // 1. Database Connection Pool
-    info!("Connecting to PostgreSQL database...");
-    let db_pool = PgPoolOptions::new()
-        .max_connections(20)
-        .connect(&config.database_url)
-        .await?;
-    info!("PostgreSQL connection established successfully");
-
-    // 2. Redis Connection
-    info!("Connecting to Redis...");
-    let session_store = Arc::new(RedisSessionStore::new(&config.redis_url).await?);
-    info!("Redis connection established successfully");
-
-    // 3. Cryptography & Security
-    let crypto = Arc::new(DefaultCryptoService::new(
-        config.jwt_secret.clone(),
-        config.access_token_ttl_seconds,
-        config.refresh_token_ttl_seconds,
-    ));
-
-    // 4. Repositories
-    let user_repo = Arc::new(PostgresUserRepository::new(db_pool.clone()));
-    let rbac_repo = Arc::new(PostgresRbacRepository::new(db_pool.clone()));
-    let session_metadata_repo = Arc::new(PostgresSessionMetadataRepository::new(db_pool.clone()));
-    let mfa_repo = Arc::new(PostgresMfaRepository::new(db_pool.clone()));
-    let outbox_repo = Arc::new(PostgresOutboxRepository::new(db_pool.clone()));
-    let client_repo = Arc::new(PostgresOAuthClientRepository::new(db_pool.clone()));
-    let code_store = Arc::new(RedisOAuthCodeStore::new(session_store.manager()));
-
-    // 5. Application Use Cases
-    let register_use_case = Arc::new(RegisterUseCase::new(
-        user_repo.clone(),
-        rbac_repo.clone(),
-        session_store.clone(),
-        outbox_repo.clone(),
-        crypto.clone(),
-    ));
-
-    let verify_email_use_case = Arc::new(VerifyEmailUseCase::new(
-        user_repo.clone(),
-        session_store.clone(),
-    ));
-
-    let login_use_case = Arc::new(LoginUseCase::new(
-        user_repo.clone(),
-        rbac_repo.clone(),
-        mfa_repo.clone(),
-        session_store.clone(),
-        session_metadata_repo.clone(),
-        outbox_repo.clone(),
-        crypto.clone(),
-        config.refresh_token_ttl_seconds,
-    ));
-
-    let mfa_use_case = Arc::new(MfaUseCase::new(
-        user_repo.clone(),
-        rbac_repo.clone(),
-        mfa_repo.clone(),
-        session_store.clone(),
-        session_metadata_repo.clone(),
-        outbox_repo.clone(),
-        crypto.clone(),
-        config.refresh_token_ttl_seconds,
-    ));
-
-    let sessions_use_case = Arc::new(SessionsUseCase::new(
-        session_store.clone(),
-        session_metadata_repo.clone(),
-        outbox_repo.clone(),
-    ));
-
-    let oauth_use_case = Arc::new(OAuthUseCase::new(
-        client_repo.clone(),
-        code_store.clone(),
-        user_repo.clone(),
-        rbac_repo.clone(),
-        session_store.clone(),
-        session_metadata_repo.clone(),
-        crypto.clone(),
-        config.oauth_issuer.clone(),
-        config.refresh_token_ttl_seconds,
-    ));
-
-    // 6. Background Outbox Relay to Kafka
-    let outbox_worker_repo = outbox_repo.clone();
-    let kafka_brokers = config.kafka_brokers.clone();
-    let kafka_topic = config.kafka_identity_topic.clone();
-
+    let state = AppState::connect(config).await?;
+    if command == "bootstrap-admin" {
+        bootstrap_admin(&state).await?;
+        return Ok(());
+    }
+    let tls = axum_server::tls_rustls::RustlsConfig::from_pem_file(
+        &state.config.tls_cert_file,
+        &state.config.tls_key_file,
+    )
+    .await?;
+    let address = std::net::SocketAddr::from(([0, 0, 0, 0], state.config.http_port));
+    let relay = tokio::spawn(identity_service::outbox::run(state.clone()));
+    let handle = axum_server::Handle::new();
+    let shutdown_handle = handle.clone();
     tokio::spawn(async move {
-        match OutboxRelayWorker::new(outbox_worker_repo, kafka_brokers, &kafka_topic).await {
-            Ok(worker) => {
-                info!("Outbox Relay worker successfully initialized");
-                worker.run().await;
-            }
-            Err(e) => {
-                error!("Failed to initialize Outbox Relay worker: {}", e);
-            }
-        }
+        shutdown_signal().await;
+        shutdown_handle.graceful_shutdown(Some(std::time::Duration::from_secs(15)));
     });
-
-    // 7. Tonic gRPC Server
-    let grpc_service = GrpcIdentityService::new(
-        user_repo.clone(),
-        rbac_repo.clone(),
-        session_store.clone(),
-        sessions_use_case.clone(),
-        crypto.clone(),
+    tracing::info!(
+        port = state.config.http_port,
+        "identity HTTPS listener starting"
     );
-
-    let grpc_addr: SocketAddr = format!("0.0.0.0:{}", config.grpc_port).parse()?;
-    info!("Starting gRPC server on {}", grpc_addr);
-
-    tokio::spawn(async move {
-        if let Err(e) = tonic::transport::Server::builder()
-            .add_service(IdentityServiceServer::new(grpc_service))
-            .serve(grpc_addr)
-            .await
-        {
-            error!("gRPC server failed: {}", e);
-        }
-    });
-
-    // 8. Axum HTTP Server
-    let app_state = AppState {
-        register_use_case,
-        verify_email_use_case,
-        login_use_case,
-        mfa_use_case,
-        sessions_use_case,
-        oauth_use_case,
-        crypto,
-        issuer: config.oauth_issuer.clone(),
-    };
-
-    let router = create_router(app_state);
-    let http_addr: SocketAddr = format!("0.0.0.0:{}", config.http_port).parse()?;
-    info!("Starting HTTP REST API server on {}", http_addr);
-
-    let listener = TcpListener::bind(http_addr).await?;
-    axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown_signal())
+    axum_server::bind_rustls(address, tls)
+        .handle(handle)
+        .serve(
+            identity_service::create_router(state.clone())
+                .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
         .await?;
-
-    info!("identity-service shut down gracefully");
+    relay.abort();
+    state.db.close().await;
+    if let Some(provider) = telemetry {
+        let _ = provider.shutdown();
+    }
     Ok(())
 }
-
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        signal::ctrl_c()
-            .await
-            .expect("Failed to install Ctrl+C handler");
-    };
-
-    #[cfg(unix)]
-    let terminate = async {
-        signal::unix::signal(signal::unix::SignalKind::terminate())
-            .expect("Failed to install SIGTERM handler")
-            .recv()
-            .await;
-    };
-
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
-    tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate => {},
+async fn bootstrap_admin(state: &AppState) -> anyhow::Result<()> {
+    let email = std::env::var("ADMIN_EMAIL")?.trim().to_lowercase();
+    if email.len() > 254 || !email.contains('@') {
+        anyhow::bail!("invalid ADMIN_EMAIL");
     }
-
-    info!("Shutdown signal received, draining active requests...");
+    let password = std::env::var("ADMIN_PASSWORD")?;
+    let hash = auth::hash_password(state, password)
+        .await
+        .map_err(|_| anyhow::anyhow!("ADMIN_PASSWORD must contain 12..1024 bytes"))?;
+    let mut tx = state.db.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(742915830)")
+        .execute(&mut *tx)
+        .await?;
+    let existing=sqlx::query("SELECT u.id,EXISTS(SELECT 1 FROM user_roles ur JOIN roles r ON r.id=ur.role_id WHERE ur.user_id=u.id AND r.slug='admin') administrator FROM users u WHERE u.email=$1 FOR UPDATE").bind(&email).fetch_optional(&mut *tx).await?;
+    if let Some(row) = existing {
+        if row.get::<bool, _>("administrator") {
+            tx.commit().await?;
+            tracing::info!("bootstrap administrator already exists; password unchanged");
+            return Ok(());
+        }
+        anyhow::bail!(
+            "ADMIN_EMAIL already belongs to a non-bootstrap account; refusing privilege escalation"
+        );
+    }
+    let uid = Uuid::now_v7();
+    sqlx::query("INSERT INTO users(id,email,password_hash,is_verified) VALUES($1,$2,$3,true)")
+        .bind(uid)
+        .bind(&email)
+        .bind(hash)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("INSERT INTO user_roles(user_id,role_id) SELECT $1,id FROM roles WHERE slug IN ('user','admin')").bind(uid).execute(&mut *tx).await?;
+    identity_service::events::enqueue(
+        &mut tx,
+        &state.crypto,
+        "identity.user_registered",
+        uid,
+        serde_json::json!({"user_id":uid,"email":email}),
+        None,
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("bootstrap outbox failed"))?;
+    tx.commit().await?;
+    tracing::info!("bootstrap administrator created; MFA enrollment and MFA login required for administrative privileges");
+    Ok(())
+}
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("SIGTERM registration");
+        tokio::select! {_=tokio::signal::ctrl_c()=>{},_=terminate.recv()=>{}}
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
