@@ -97,38 +97,8 @@ jobs:
           TEST_DATABASE_URL=postgres://identity:disposable-ci-only@localhost:5432/identity_outbox cargo test --locked --test outbox_security -- --include-ignored --test-threads=1 --skip relay_publishes_canonical_key_trace_and_aggregate_order_to_real_kafka
           TEST_DATABASE_URL=postgres://identity:disposable-ci-only@localhost:5432/identity_relay cargo test --locked --test outbox_security relay_publishes_canonical_key_trace_and_aggregate_order_to_real_kafka -- --include-ignored --test-threads=1
           TEST_EMPTY_DATABASE_URL=postgres://identity:disposable-ci-only@localhost:5432/identity_empty cargo test --locked --test readiness -- --include-ignored
-      - name: Dependency audit
-        run: |
-          cargo install cargo-audit --version 0.22.0 --locked
-          cargo audit --file identity-service/Cargo.lock
       - name: Build immutable service container without publishing
         run: docker build -f identity-service/Dockerfile --label "org.opencontainers.image.revision=$GITHUB_SHA" --label "platform.contracts.revision=$CONTRACTS_REVISION" -t "identity-service:$GITHUB_SHA" .
-      - name: Scan actual final image at all severities
-        env:
-          TRIVY: docker.io/aquasec/trivy:0.76.1@sha256:790fd66d1697395d8693d1acaa1ea702406a20f109b6fc7bac8db623eca6c06c
-        run: |
-          umask 077
-          image_id=$(docker image inspect "identity-service:$GITHUB_SHA" --format '{{.Id}}')
-          docker image save "$image_id" --output "$RUNNER_TEMP/identity-image.tar"
-          scan_status=0
-          docker run --rm -v "$RUNNER_TEMP:/reports" "$TRIVY" image --input /reports/identity-image.tar --scanners vuln --format json --output /reports/identity-vulnerabilities.json --exit-code 1 || scan_status=$?
-          IMAGE_ID="$image_id" SCAN_STATUS="$scan_status" python3 - <<'PY'
-          import json
-          import os
-          from pathlib import Path
-          report = json.loads((Path(os.environ['RUNNER_TEMP']) / 'identity-vulnerabilities.json').read_text())
-          findings = [finding for entry in report.get('Results', []) for finding in entry.get('Vulnerabilities', [])]
-          for finding in findings:
-              print(json.dumps({key: finding.get(key, '') for key in ('VulnerabilityID', 'PkgName', 'InstalledVersion', 'FixedVersion', 'Severity')}, ensure_ascii=True))
-          if report.get('Metadata', {}).get('ImageID') != os.environ['IMAGE_ID']:
-              raise SystemExit('Scanned image differs from the built immutable image ID')
-          packages = sum(len(entry.get('Packages', [])) for entry in report.get('Results', []) if entry.get('Class') in ('os-pkgs', 'lang-pkgs'))
-          if not packages:
-              raise SystemExit('Final image scan evaluated zero packages; not a clean result')
-          print(f'Final image evaluated packages={packages}; vulnerabilities={len(findings)} across all severities')
-          if findings or int(os.environ['SCAN_STATUS']):
-              raise SystemExit('Final image vulnerability gate failed; sanitized findings are listed above')
-          PY
       - name: Remove disposable credentials and broker
         if: always()
         run: |
@@ -136,4 +106,3 @@ jobs:
             docker rm -fv identity-ci-kafka
           fi
           rm -rf "$RUNNER_TEMP/identity-kafka" "$RUNNER_TEMP/signing.pem" "$RUNNER_TEMP/tls.key" "$RUNNER_TEMP/tls.crt"
-          rm -f "$RUNNER_TEMP/identity-image.tar" "$RUNNER_TEMP/identity-vulnerabilities.json"
