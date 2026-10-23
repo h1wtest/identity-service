@@ -150,15 +150,9 @@ pub struct Code {
 impl Code {
     /// Prove possession before any destructive replay response. Knowing a code
     /// alone must never let an attacker revoke the legitimate browser session.
-    pub fn prove(
-        &self,
-        client: &Client,
-        redirect: &str,
-        verifier: &str,
-        now: DateTime<Utc>,
-    ) -> Result<()> {
+    /// Spent codes retain this proof after redemption expiry for replay detection.
+    pub fn prove_binding(&self, client: &Client, redirect: &str, verifier: &str) -> Result<()> {
         if self.client_id != client.client_id
-            || self.expires_at <= now
             || self.redirect_uri != redirect
             || client.redirect(redirect).is_err()
             || !(43..=128).contains(&verifier.len())

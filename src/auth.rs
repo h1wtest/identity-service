@@ -606,6 +606,7 @@ async fn revoke_tx(
 async fn logout(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Response> {
     let actor = mutation(&state, &headers).await?;
     let mut tx = state.db.begin().await?;
+    lock_authorized_actor(&mut tx, &actor, false, None).await?;
     revoke_tx(
         &state,
         &mut tx,
@@ -636,6 +637,7 @@ async fn revoke(
 ) -> ApiResult<Json<Value>> {
     let actor = mutation(&state, &headers).await?;
     let mut tx = state.db.begin().await?;
+    lock_authorized_actor(&mut tx, &actor, false, None).await?;
     let owner: Option<Uuid> = sqlx::query_scalar("SELECT user_id FROM sessions WHERE id=$1")
         .bind(sid)
         .fetch_optional(&mut *tx)
@@ -658,6 +660,7 @@ async fn revoke(
 async fn revoke_all(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Response> {
     let actor = mutation(&state, &headers).await?;
     let mut tx = state.db.begin().await?;
+    lock_authorized_actor(&mut tx, &actor, false, None).await?;
     let count = revoke_tx(
         &state,
         &mut tx,

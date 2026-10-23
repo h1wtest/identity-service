@@ -7,14 +7,14 @@ rust-version = "1.99"
 [dependencies]
 tokio = { version = "1.43", features = ["full"] }
 axum = { version = "0.8", features = ["macros", "form"] }
-axum-server = { version = "0.7", features = ["tls-rustls-no-provider"] }
+axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["trace", "limit"] }
 rskafka = { version = "0.6", features = ["transport-tls"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-rustls-pemfile = "2"
+rustls-pki-types = { version = "1.13", features = ["std"] }
 async-trait = "0.1"
-sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "migrate", "json"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "postgres", "macros", "uuid", "chrono", "migrate", "json"] }
 argon2 = "0.5"
 jsonwebtoken = "9.3"
 aes-gcm = "0.10"
@@ -38,7 +38,7 @@ tracing-opentelemetry = "0.28"
 opentelemetry = "0.27"
 opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.27", features = ["http-proto", "reqwest-client"] }
-prometheus = "0.13"
+prometheus = { version = "0.14", default-features = false }
 thiserror = "2.0"
 anyhow = "1.0"
 dotenvy = "0.15"

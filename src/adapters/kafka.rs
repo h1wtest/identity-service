@@ -10,6 +10,7 @@ use rskafka::{
     },
     record::Record,
 };
+use rustls_pki_types::{pem::PemObject, CertificateDer};
 use std::{collections::BTreeMap, sync::Arc};
 
 /// Construct the actual authenticated transport. No plaintext or anonymous fallback.
@@ -21,10 +22,9 @@ pub async fn client(config: &Config) -> anyhow::Result<Client> {
         anyhow::bail!("Kafka TLS CA and SASL credentials required");
     }
     let pem = tokio::fs::read(&config.kafka_tls_ca_file).await?;
-    let mut input = std::io::Cursor::new(pem);
     let mut roots = rustls::RootCertStore::empty();
     let mut certificates = 0;
-    for certificate in rustls_pemfile::certs(&mut input) {
+    for certificate in CertificateDer::pem_slice_iter(&pem) {
         roots.add(certificate?)?;
         certificates += 1;
     }

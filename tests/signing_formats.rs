@@ -179,3 +179,124 @@ fn previous_ec_oid_and_weak_rsa_key_are_rejected() {
         assert!(Crypto::new(&config).is_err());
     }
 }
+
+#[tokio::test]
+#[ignore = "requires full identity env and actual OpenSSL fixture CLI"]
+async fn https_certificate_chain_accepts_pkcs8_and_pkcs1_and_rejects_mismatched_keys() {
+    let keys = Keys::new();
+    keys.rsa("tls-pkcs8.pem", "2048");
+    keys.rsa("wrong.pem", "2048");
+    keys.openssl(&[
+        "rsa",
+        "-in",
+        "tls-pkcs8.pem",
+        "-traditional",
+        "-out",
+        "tls-pkcs1.pem",
+    ]);
+    keys.openssl(&[
+        "req",
+        "-new",
+        "-x509",
+        "-key",
+        "tls-pkcs8.pem",
+        "-subj",
+        "/CN=localhost",
+        "-addext",
+        "subjectAltName=DNS:localhost",
+        "-addext",
+        "basicConstraints=critical,CA:FALSE",
+        "-addext",
+        "extendedKeyUsage=serverAuth",
+        "-days",
+        "1",
+        "-out",
+        "cert.pem",
+    ]);
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let certificate = std::fs::read(keys.path("cert.pem")).unwrap();
+    let chain = [certificate.as_slice(), certificate.as_slice()].concat();
+    std::fs::write(keys.path("chain.pem"), &chain).unwrap();
+    for key in ["tls-pkcs8.pem", "tls-pkcs1.pem"] {
+        let tls = axum_server::tls_rustls::RustlsConfig::from_pem_file(
+            keys.path("chain.pem"),
+            keys.path(key),
+        )
+        .await
+        .unwrap();
+        use rustls_pki_types::{pem::PemObject, CertificateDer, ServerName};
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(CertificateDer::from_pem_slice(&certificate).unwrap())
+            .unwrap();
+        let client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let mut client = rustls::ClientConnection::new(
+            std::sync::Arc::new(client_config),
+            ServerName::try_from("localhost").unwrap(),
+        )
+        .unwrap();
+        let mut server = rustls::ServerConnection::new(tls.get_inner()).unwrap();
+        for _ in 0..10 {
+            let mut to_server = Vec::new();
+            client.write_tls(&mut to_server).unwrap();
+            server
+                .read_tls(&mut std::io::Cursor::new(to_server))
+                .unwrap();
+            server.process_new_packets().unwrap();
+            let mut to_client = Vec::new();
+            server.write_tls(&mut to_client).unwrap();
+            client
+                .read_tls(&mut std::io::Cursor::new(to_client))
+                .unwrap();
+            client.process_new_packets().unwrap();
+            if !client.is_handshaking() && !server.is_handshaking() {
+                break;
+            }
+        }
+        assert!(!client.is_handshaking());
+        assert!(!server.is_handshaking());
+        assert_eq!(client.peer_certificates().unwrap().len(), 2);
+    }
+    assert!(axum_server::tls_rustls::RustlsConfig::from_pem_file(
+        keys.path("chain.pem"),
+        keys.path("wrong.pem"),
+    )
+    .await
+    .is_err());
+}
+
+#[tokio::test]
+#[ignore = "requires full identity env and actual OpenSSL fixture CLI"]
+async fn kafka_ca_rejects_empty_malformed_and_invalid_certificates_before_connecting() {
+    let keys = Keys::new();
+    let mut config = Config::from_env().unwrap();
+    config.kafka_tls_ca_file = keys.path("ca.pem").to_string_lossy().into_owned();
+    config.kafka_brokers = vec!["127.0.0.1:1".into()];
+    std::fs::write(keys.path("ca.pem"), b"not a certificate").unwrap();
+    let Err(error) = identity_service::adapters::kafka::client(&config).await else {
+        panic!("empty CA must fail before opening a broker connection");
+    };
+    assert_eq!(error.to_string(), "Kafka TLS CA contains no certificates");
+    std::fs::write(
+        keys.path("ca.pem"),
+        b"-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n",
+    )
+    .unwrap();
+    let Err(error) = identity_service::adapters::kafka::client(&config).await else {
+        panic!("malformed CA must fail before opening a broker connection");
+    };
+    assert!(error
+        .downcast_ref::<rustls_pki_types::pem::Error>()
+        .is_some());
+    std::fs::write(
+        keys.path("ca.pem"),
+        b"-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n",
+    )
+    .unwrap();
+    let Err(error) = identity_service::adapters::kafka::client(&config).await else {
+        panic!("invalid certificate DER must fail before opening a broker connection");
+    };
+    assert!(error.downcast_ref::<rustls::Error>().is_some());
+}

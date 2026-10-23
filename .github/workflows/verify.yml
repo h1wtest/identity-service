@@ -27,7 +27,7 @@ jobs:
         ports: ["5432:5432"]
         options: --health-cmd "pg_isready -U identity -d identity_test" --health-interval 5s --health-timeout 3s --health-retries 15
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           path: identity-service
           fetch-depth: 0
@@ -38,7 +38,7 @@ jobs:
             echo "PLATFORM_CONTRACTS_REVISION must be an explicit immutable commit" >&2
             exit 1
           fi
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: h1wtest/platform-contracts
           ref: ${{ env.CONTRACTS_REVISION }}
@@ -110,18 +110,24 @@ jobs:
           umask 077
           image_id=$(docker image inspect "identity-service:$GITHUB_SHA" --format '{{.Id}}')
           docker image save "$image_id" --output "$RUNNER_TEMP/identity-image.tar"
-          docker run --rm -v "$RUNNER_TEMP:/reports" "$TRIVY" image --input /reports/identity-image.tar --scanners vuln --format json --output /reports/identity-vulnerabilities.json --exit-code 1
-          IMAGE_ID="$image_id" python3 - <<'PY'
+          scan_status=0
+          docker run --rm -v "$RUNNER_TEMP:/reports" "$TRIVY" image --input /reports/identity-image.tar --scanners vuln --format json --output /reports/identity-vulnerabilities.json --exit-code 1 || scan_status=$?
+          IMAGE_ID="$image_id" SCAN_STATUS="$scan_status" python3 - <<'PY'
           import json
           import os
           from pathlib import Path
           report = json.loads((Path(os.environ['RUNNER_TEMP']) / 'identity-vulnerabilities.json').read_text())
+          findings = [finding for entry in report.get('Results', []) for finding in entry.get('Vulnerabilities', [])]
+          for finding in findings:
+              print(json.dumps({key: finding.get(key, '') for key in ('VulnerabilityID', 'PkgName', 'InstalledVersion', 'FixedVersion', 'Severity')}, ensure_ascii=True))
           if report.get('Metadata', {}).get('ImageID') != os.environ['IMAGE_ID']:
               raise SystemExit('Scanned image differs from the built immutable image ID')
           packages = sum(len(entry.get('Packages', [])) for entry in report.get('Results', []) if entry.get('Class') in ('os-pkgs', 'lang-pkgs'))
           if not packages:
               raise SystemExit('Final image scan evaluated zero packages; not a clean result')
-          print(f'Final image evaluated packages={packages}; zero vulnerabilities across all severities')
+          print(f'Final image evaluated packages={packages}; vulnerabilities={len(findings)} across all severities')
+          if findings or int(os.environ['SCAN_STATUS']):
+              raise SystemExit('Final image vulnerability gate failed; sanitized findings are listed above')
           PY
       - name: Remove disposable credentials and broker
         if: always()

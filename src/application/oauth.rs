@@ -164,7 +164,7 @@ impl<'a> OAuth<'a> {
         let subject = tx.code_subject(&hash).await?.ok_or(Error::InvalidGrant)?;
         let live = tx.lock_session(subject).await?;
         let code = tx.lock_code(&hash).await?.ok_or(Error::InvalidGrant)?;
-        code.prove(client, redirect, verifier, Utc::now())?;
+        code.prove_binding(client, redirect, verifier)?;
         if code.subject.user_id != subject.user_id || code.subject.session_id != subject.session_id
         {
             return Err(Error::InvalidGrant);
@@ -175,6 +175,9 @@ impl<'a> OAuth<'a> {
                     .await?;
                 tx.commit().await?;
             }
+            return Err(Error::InvalidGrant);
+        }
+        if code.expires_at <= Utc::now() {
             return Err(Error::InvalidGrant);
         }
         let session = live.ok_or(Error::InvalidGrant)?;

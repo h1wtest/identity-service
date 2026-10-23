@@ -1,5 +1,5 @@
 use identity_service::{config::Config, security::PayloadCipher};
-use sqlx::postgres::PgPoolOptions;
+use sqlx::{postgres::PgPoolOptions, AssertSqlSafe};
 use uuid::Uuid;
 
 #[tokio::test]
@@ -13,7 +13,8 @@ async fn legacy_factor_cutover_failure_rolls_back_then_correct_key_retry_is_idem
         .connect(&url)
         .await
         .unwrap();
-    sqlx::query(&format!("CREATE SCHEMA {schema}"))
+    // The schema identifier is generated locally from a UUID, never from input.
+    sqlx::query(AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
         .execute(&setup)
         .await
         .unwrap();
@@ -23,7 +24,9 @@ async fn legacy_factor_cutover_failure_rolls_back_then_correct_key_retry_is_idem
         .after_connect(move |connection, _| {
             let query = format!("SET search_path TO {search_schema}");
             Box::pin(async move {
-                sqlx::query(&query).execute(connection).await?;
+                sqlx::query(AssertSqlSafe(query))
+                    .execute(connection)
+                    .await?;
                 Ok(())
             })
         })
@@ -84,7 +87,7 @@ async fn legacy_factor_cutover_failure_rolls_back_then_correct_key_retry_is_idem
             .is_err()
     );
     pool.close().await;
-    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+    sqlx::query(AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
         .execute(&setup)
         .await
         .unwrap();

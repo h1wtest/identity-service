@@ -12,7 +12,7 @@ use identity_service::{
     AppState,
 };
 use serde_json::{json, Value};
-use sqlx::postgres::PgPoolOptions;
+use sqlx::{postgres::PgPoolOptions, AssertSqlSafe};
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -38,7 +38,8 @@ impl Fixture {
             .connect(&database_url)
             .await
             .unwrap();
-        sqlx::query(&format!("CREATE SCHEMA {schema}"))
+        // The schema identifier is generated locally from a UUID, never from input.
+        sqlx::query(AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
             .execute(&setup)
             .await
             .unwrap();
@@ -47,7 +48,7 @@ impl Fixture {
             .after_connect(move |conn, _| {
                 let command = format!("SET search_path TO {schema}");
                 Box::pin(async move {
-                    sqlx::query(&command).execute(conn).await?;
+                    sqlx::query(AssertSqlSafe(command)).execute(conn).await?;
                     Ok(())
                 })
             })
@@ -703,21 +704,71 @@ async fn spent_code_without_bound_pkce_and_redirect_cannot_revoke_victim_session
     let code = f.code("openid offline_access").await;
     let (status, tokens) = f.exchange(&code, VERIFIER, CALLBACK).await;
     assert_eq!(status, StatusCode::OK);
-    for (verifier, redirect) in [
-        ("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", CALLBACK),
-        (VERIFIER, "https://attacker.invalid/callback"),
-    ] {
-        let (status, _) = f.exchange(&code, verifier, redirect).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        let live: bool = sqlx::query_scalar("SELECT is_active FROM sessions WHERE id=$1")
-            .bind(f.sid)
-            .fetch_one(&f.state.db)
-            .await
-            .unwrap();
-        assert!(live);
-        let revoked:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM oauth_token_families WHERE session_id=$1 AND revoked_at IS NOT NULL)").bind(f.sid).fetch_one(&f.state.db).await.unwrap();
-        assert!(!revoked);
+    for expired in [false, true] {
+        if expired {
+            sqlx::query("UPDATE oauth_authorization_codes SET expires_at=NOW()-INTERVAL '1 second' WHERE code_hash=$1")
+                .bind(digest(&code)).execute(&f.state.db).await.unwrap();
+        }
+        for (verifier, redirect) in [
+            ("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", CALLBACK),
+            (VERIFIER, "https://attacker.invalid/callback"),
+        ] {
+            let (status, _) = f.exchange(&code, verifier, redirect).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            let live: bool = sqlx::query_scalar("SELECT is_active FROM sessions WHERE id=$1")
+                .bind(f.sid)
+                .fetch_one(&f.state.db)
+                .await
+                .unwrap();
+            assert!(live);
+            let revoked:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM oauth_token_families WHERE session_id=$1 AND revoked_at IS NOT NULL)").bind(f.sid).fetch_one(&f.state.db).await.unwrap();
+            assert!(!revoked);
+        }
     }
     let (status, _) = f.refresh(tokens["refresh_token"].as_str().unwrap()).await;
     assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+#[ignore = "requires real TEST_DATABASE_URL and RSA signing/encryption environment"]
+async fn expired_consumed_code_with_bound_proof_revokes_live_family_and_session() {
+    let f = Fixture::new().await;
+    let code = f.code("openid offline_access").await;
+    let (status, tokens) = f.exchange(&code, VERIFIER, CALLBACK).await;
+    assert_eq!(status, StatusCode::OK);
+    sqlx::query("UPDATE oauth_authorization_codes SET expires_at=NOW()-INTERVAL '1 second' WHERE code_hash=$1")
+        .bind(digest(&code)).execute(&f.state.db).await.unwrap();
+    assert_eq!(
+        f.userinfo(tokens["access_token"].as_str().unwrap()).await.0,
+        StatusCode::OK
+    );
+    let (status, error) = f.exchange(&code, VERIFIER, CALLBACK).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(error["error"], "invalid_grant");
+    let reason: Option<String> = sqlx::query_scalar("SELECT revoked_reason FROM oauth_token_families WHERE session_id=$1 AND revoked_at IS NOT NULL")
+        .bind(f.sid).fetch_one(&f.state.db).await.unwrap();
+    assert_eq!(reason.as_deref(), Some("oauth_code_reuse"));
+    let session: (bool, Option<String>) = sqlx::query_as("SELECT is_active,revoked_reason FROM sessions WHERE id=$1")
+        .bind(f.sid).fetch_one(&f.state.db).await.unwrap();
+    assert!(!session.0);
+    assert_eq!(session.1.as_deref(), Some("oauth_code_reuse"));
+    let envelopes: Vec<Value> = sqlx::query_scalar("SELECT payload FROM outbox_events WHERE aggregate_id=$1 AND event_type='identity.session_revoked'")
+        .bind(f.uid.to_string()).fetch_all(&f.state.db).await.unwrap();
+    assert_eq!(envelopes.len(), 1);
+    let envelope: platform_contracts::Envelope = serde_json::from_value(envelopes[0].clone()).unwrap();
+    envelope.validate().unwrap();
+    assert_eq!(envelope.aggregate_id, f.uid);
+    assert_eq!(envelope.payload.unwrap(), json!({
+        "user_id": f.uid,
+        "session_id": f.sid,
+        "reason": "oauth_code_reuse"
+    }));
+    assert_eq!(
+        f.userinfo(tokens["access_token"].as_str().unwrap()).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        f.refresh(tokens["refresh_token"].as_str().unwrap()).await.0,
+        StatusCode::BAD_REQUEST
+    );
 }

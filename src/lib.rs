@@ -294,3 +294,30 @@ async fn observe(State(state): State<AppState>, mut request: Request, next: Next
     }
     response
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metrics_preserve_prometheus_text_counters_and_histograms() {
+        let metrics = Metrics::new().unwrap();
+        metrics.requests.with_label_values(&["GET", "200"]).inc();
+        metrics.duration.with_label_values(&["GET"]).observe(0.25);
+        let mut bytes = Vec::new();
+        TextEncoder::new()
+            .encode(&metrics.registry.gather(), &mut bytes)
+            .unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        for sample in [
+            "# TYPE http_requests_total counter\n",
+            "http_requests_total{method=\"GET\",status=\"200\"} 1\n",
+            "# TYPE http_request_duration_seconds histogram\n",
+            "http_request_duration_seconds_bucket{method=\"GET\",le=\"0.25\"} 1\n",
+            "http_request_duration_seconds_sum{method=\"GET\"} 0.25\n",
+            "http_request_duration_seconds_count{method=\"GET\"} 1\n",
+        ] {
+            assert!(text.contains(sample), "missing Prometheus sample: {sample}");
+        }
+    }
+}

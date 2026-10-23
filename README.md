@@ -15,6 +15,10 @@ The final image is `scratch`: a musl-static Rust executable and the pinned-build
 
 The checked-in `rust-toolchain.toml` pins Rust 1.99.0. Cargo.lock is the dependency authority; builds use `--locked`. Empty secrets fail closed. `MFA_ENCRYPTION_KEY` (identity only) and distinct `DELIVERY_ENCRYPTION_KEY` (identity and notification worker only) are independent base64 32-byte keys. Caller credentials and `GATEWAY_INTERNAL_TOKEN` are distinct random strings of at least 32 characters. TLS is mandatory on port 8001. Gateway authentication protects forwarded client IP; untrusted requests use socket peer IP. Kafka requires CA/hostname verification and SCRAM-SHA256 using `KAFKA_TLS_CA_FILE`, `KAFKA_SASL_USERNAME`, `KAFKA_SASL_PASSWORD`, without plaintext fallback. Mount keys as uid 10001. Keep previous public signing key and distinct kid while old tokens expire, never distribute its private key.
 
+Dependency remediation uses SQLx **0.9.0** with `default-features = false` and explicit PostgreSQL, Tokio/rustls-ring, UUID/chrono/JSON, macros and migration support. The active driver is PostgreSQL only; no MySQL authentication or `rsa` crate is used. Cargo's [weak-feature lockfile issue](https://github.com/transact-rs/sqlx/issues/3211) still records optional `sqlx-mysql`/`sqlx-sqlite` 0.9.0 metadata, so lockfile presence alone is not proof a driver is compiled. Unlike 0.8.6, the maintained 0.9.0 MySQL dependency does not enable RSA by default. SQLx migrations remain embedded with `sqlx::migrate!`; prepared statements, checksums and transactional authorization are unchanged. Test-only dynamic schema identifiers are locally generated UUIDs and explicitly marked `AssertSqlSafe` for SQLx 0.9.
+
+Prometheus **0.14.0** disables unused default protobuf encoding: `/metrics` continues to serve Prometheus **text/plain; version=0.0.4**, including counters, latency histogram buckets/sum/count and operational gauges. This removes protobuf 2.28.0 rather than waiving RUSTSEC-2024-0437; binary protobuf metrics were never exposed. HTTPS uses axum-server **0.8.0**, whose PEM loader uses maintained `rustls-pki-types`; the direct Kafka CA loader uses `CertificateDer::pem_slice_iter` from resolved `rustls-pki-types` **1.15.1**. `rustls-pemfile` is no longer a dependency. HTTPS certificate chains and PKCS1/PKCS8 RSA keys remain supported; signing/JWKS still supports PKCS1/PKCS8 private keys and PKCS1/SPKI previous public keys through the existing ring/DER path. Empty, malformed or invalid Kafka CA material fails before a broker connection; hostname/CA verification and SCRAM remain mandatory.
+
 ```sh
 # Fresh schema needs DATABASE_URL only; legacy MFA additionally requires the new identity-only key.
 DATABASE_URL="$IDENTITY_MIGRATION_URL" MFA_ENCRYPTION_KEY="$MFA_KEY" identity-service migrate
@@ -71,6 +75,7 @@ To reproduce, supply full `.env.example` configuration with disposable credentia
 cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
+cargo audit --deny warnings
 TEST_DATABASE_URL="$IDENTITY_TEST_DB" cargo test --locked \
   --test auth_security --test authorization_race --test mfa_migration \
   --test mfa_password --test oauth_security --test rekey \
@@ -88,6 +93,8 @@ TEST_EMPTY_DATABASE_URL="$EMPTY_TEST_DB" cargo test --locked --test readiness \
 ```
 
 The relay database starts fresh and the broker must expose actual six-partition topics over authenticated TLS. The empty database is intentionally left unmigrated. The migration regression temporarily changes its process environment and must run serially. OpenSSL is a test-only external verifier/fixture generator, not part of the production image.
+
+The dependency changes and added metrics/HTTPS-chain/CA-import regressions require a fresh controller run of the commands above, including every ignored signing/format test and the real PostgreSQL/Kafka regressions. Earlier local evidence does not certify the regenerated dependency graph. Audit the full committed Cargo.lock without advisory ignores or package filtering, then rebuild and scan the final image.
 
 Remote GitHub CI has **not** been executed or published by the local controller. Identity CI requires repository variable `PLATFORM_CONTRACTS_REVISION` or dispatch input `contracts_revision` containing an approved immutable 40-character lowercase commit SHA; missing/branch/tag values fail closed. CI records both source revisions. A local uncommitted contracts tree must not be represented as a remotely published revision. External Telegram credentials remain an explicit acceptance prerequisite.
 CI fetches complete service history and scans it with redacted Gitleaks output before installing dependencies or generating credentials; the pinned contracts tree is scanned separately. Checkout credentials are not persisted. Disposable private keys are owner-readable only, generated tokens are masked before environment export, and broker/credential cleanup runs on success or failure. The database and authenticated TLS/SCRAM relay checks remain real, isolated dependencies, not mocks. First publication must use push/PR checks; manual dispatch is available once the workflow is on `main`.

@@ -1,5 +1,5 @@
 use identity_service::{rekey, security::PayloadCipher};
-use sqlx::postgres::PgPoolOptions;
+use sqlx::{postgres::PgPoolOptions, AssertSqlSafe};
 use uuid::Uuid;
 
 #[tokio::test]
@@ -12,7 +12,8 @@ async fn existing_common_ciphertext_rekeys_atomically_and_unknown_cipher_rolls_b
         .connect(&url)
         .await
         .unwrap();
-    sqlx::query(&format!("CREATE SCHEMA {schema}"))
+    // The schema identifier is generated locally from a UUID, never from input.
+    sqlx::query(AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
         .execute(&setup)
         .await
         .unwrap();
@@ -22,7 +23,9 @@ async fn existing_common_ciphertext_rekeys_atomically_and_unknown_cipher_rolls_b
         .after_connect(move |connection, _| {
             let command = format!("SET search_path TO {search}");
             Box::pin(async move {
-                sqlx::query(&command).execute(connection).await?;
+                sqlx::query(AssertSqlSafe(command))
+                    .execute(connection)
+                    .await?;
                 Ok(())
             })
         })
@@ -127,7 +130,7 @@ async fn existing_common_ciphertext_rekeys_atomically_and_unknown_cipher_rolls_b
             .unwrap();
     assert_eq!(migrated, twice);
     pool.close().await;
-    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+    sqlx::query(AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
         .execute(&setup)
         .await
         .unwrap();
