@@ -26,9 +26,15 @@ pub fn router(state: AppState) -> Router {
         .route("/.well-known/openid-configuration", get(discovery))
         .route("/.well-known/jwks.json", get(jwks))
         .route("/oauth/authorize", get(authorize))
+        .route(
+            "/api/v1/auth/oauth/consent/{id}",
+            get(consent_get).post(consent_decide),
+        )
+        .route("/oauth/consent/complete/{id}", get(consent_complete))
         .route("/oauth/token", post(token))
         .route("/oauth/userinfo", get(userinfo))
-        .with_state(state)
+        .with_state(state.clone())
+        .merge(crate::oauth_grants::router(state))
 }
 
 struct HttpError(Error);
@@ -100,7 +106,7 @@ async fn jwks(State(state): State<AppState>) -> Json<Value> {
     Json(state.crypto.jwks())
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, serde::Serialize)]
 struct AuthorizeRequest {
     client_id: String,
     redirect_uri: String,
@@ -175,6 +181,33 @@ async fn authorize(
         }
         Err(_) => return Err(Error::Dependency.into()),
     };
+    let policy: Option<bool> = sqlx::query_scalar(
+        "SELECT trusted_first_party FROM oauth_clients WHERE client_id=$1 AND revoked_at IS NULL",
+    )
+    .bind(&request.client_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|_| Error::Dependency)?;
+    let trusted = policy.ok_or(Error::InvalidClient)?;
+    let scopes: Vec<String> = request
+        .scope
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect();
+    let consent:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM oauth_consents WHERE user_id=$1 AND client_id=$2 AND scopes @> $3)").bind(actor.user_id).bind(&request.client_id).bind(&scopes).fetch_one(&state.db).await.map_err(|_|Error::Dependency)?;
+    if !trusted && !consent {
+        if request.prompt.as_deref() == Some("none") {
+            return Ok(redirect(
+                approved.redirect,
+                request.state.as_deref(),
+                "error",
+                "consent_required",
+            ));
+        }
+        let id = uuid::Uuid::now_v7();
+        sqlx::query("INSERT INTO oauth_consent_requests(id,user_id,session_id,client_id,request,scopes) VALUES($1,$2,$3,$4,$5,$6)").bind(id).bind(actor.user_id).bind(actor.session_id).bind(&request.client_id).bind(serde_json::to_value(&request).map_err(|_|Error::Dependency)?).bind(scopes).execute(&state.db).await.map_err(|_|Error::Dependency)?;
+        return Ok(Redirect::to(&format!("/oauth/consent?request_id={id}")).into_response());
+    }
     let result = service
         .authorize(
             Subject {
@@ -364,5 +397,112 @@ async fn userinfo(
     )?;
     let mut response = Json(info).into_response();
     no_store(&mut response);
+    Ok(response)
+}
+
+async fn consent_get(
+    State(s): State<AppState>,
+    h: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<uuid::Uuid>,
+) -> crate::ApiResult<Json<Value>> {
+    use sqlx::Row;
+    let a = auth::authenticate(&s, &h).await?;
+    let row=sqlx::query("SELECT c.client_name,r.scopes,r.expires_at FROM oauth_consent_requests r JOIN oauth_clients c ON c.client_id=r.client_id WHERE r.id=$1 AND r.user_id=$2 AND r.session_id=$3 AND r.consumed_at IS NULL AND r.expires_at>now() AND c.revoked_at IS NULL").bind(id).bind(a.user_id).bind(a.session_id).fetch_optional(&s.db).await?.ok_or_else(||crate::ApiError::bad("consent_unavailable"))?;
+    Ok(Json(
+        json!({"request_id":id,"client_name":row.get::<String,_>("client_name"),"scopes":row.get::<Vec<String>,_>("scopes"),"expires_at":row.get::<chrono::DateTime<chrono::Utc>,_>("expires_at")}),
+    ))
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConsentDecision {
+    approved: bool,
+}
+async fn consent_decide(
+    State(s): State<AppState>,
+    h: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<uuid::Uuid>,
+    Json(b): Json<ConsentDecision>,
+) -> crate::ApiResult<Json<Value>> {
+    let a = auth::mutation(&s, &h).await?;
+    let mut tx = s.db.begin().await?;
+    auth::lock_authorized_actor(&mut tx, &a, false, None).await?;
+    let changed=sqlx::query("UPDATE oauth_consent_requests SET approved=$4 WHERE id=$1 AND user_id=$2 AND session_id=$3 AND consumed_at IS NULL AND approved IS NULL AND expires_at>now()").bind(id).bind(a.user_id).bind(a.session_id).bind(b.approved).execute(&mut *tx).await?;
+    if changed.rows_affected() != 1 {
+        return Err(crate::ApiError::bad("consent_unavailable"));
+    }
+    tx.commit().await?;
+    Ok(Json(
+        json!({"redirect_to":format!("/oauth/consent/complete/{id}")}),
+    ))
+}
+async fn consent_complete(
+    State(s): State<AppState>,
+    h: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<uuid::Uuid>,
+) -> crate::ApiResult<Response> {
+    use sqlx::Row;
+    let a = auth::authenticate(&s, &h).await?;
+    let mut tx = s.db.begin().await?;
+    let client_id: Option<String> = sqlx::query_scalar(
+        "SELECT client_id FROM oauth_consent_requests WHERE id=$1 AND user_id=$2 AND session_id=$3",
+    )
+    .bind(id)
+    .bind(a.user_id)
+    .bind(a.session_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let client_id = client_id.ok_or_else(|| crate::ApiError::bad("consent_unavailable"))?;
+    sqlx::query(
+        "SELECT client_id FROM oauth_clients WHERE client_id=$1 AND revoked_at IS NULL FOR UPDATE",
+    )
+    .bind(&client_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| crate::ApiError::bad("consent_unavailable"))?;
+    auth::lock_authorized_actor(&mut tx, &a, false, None).await?;
+    let row=sqlx::query("SELECT request,approved,client_id,scopes FROM oauth_consent_requests WHERE id=$1 AND user_id=$2 AND session_id=$3 AND consumed_at IS NULL AND expires_at>now() AND approved IS NOT NULL FOR UPDATE").bind(id).bind(a.user_id).bind(a.session_id).fetch_optional(&mut *tx).await?.ok_or_else(||crate::ApiError::bad("consent_unavailable"))?;
+    let request: AuthorizeRequest =
+        serde_json::from_value(row.get("request")).map_err(|_| crate::ApiError::dependency())?;
+    let store = PgGrantStore::new(s.db.clone(), s.crypto.clone());
+    let service = OAuth::new(&store, &s.crypto, &s.config.issuer);
+    let approved = service
+        .authorization(
+            &request.client_id,
+            Authorization {
+                redirect_uri: &request.redirect_uri,
+                response_type: &request.response_type,
+                response_mode: request.response_mode.as_deref(),
+                prompt: request.prompt.as_deref(),
+                scope: &request.scope,
+                nonce: request.nonce.as_deref(),
+                challenge: request.code_challenge.as_deref(),
+                challenge_method: request.code_challenge_method.as_deref(),
+            },
+        )
+        .await
+        .map_err(|_| crate::ApiError::bad("consent_unavailable"))?;
+    let response = if row.get::<bool, _>("approved") {
+        let scopes: Vec<String> = row.get("scopes");
+        sqlx::query("INSERT INTO oauth_consents(user_id,client_id,scopes) VALUES($1,$2,$3) ON CONFLICT(user_id,client_id) DO UPDATE SET scopes=ARRAY(SELECT DISTINCT unnest(oauth_consents.scopes||EXCLUDED.scopes)),updated_at=now()").bind(a.user_id).bind(&request.client_id).bind(scopes).execute(&mut *tx).await?;
+        let code = crate::security::random_token();
+        let changed=sqlx::query("INSERT INTO oauth_authorization_codes(code_hash,client_id,session_id,user_id,redirect_uri,scope,nonce,code_challenge,expires_at) SELECT $1,$2,s.id,s.user_id,$5,$6,$7,$8,LEAST(now()+interval '120 seconds',s.expires_at) FROM sessions s JOIN oauth_clients c ON c.client_id=$2 AND c.revoked_at IS NULL WHERE s.id=$3 AND s.user_id=$4 AND s.is_active AND s.expires_at>now()")
+            .bind(crate::security::digest(&code)).bind(&request.client_id).bind(a.session_id).bind(a.user_id).bind(&request.redirect_uri).bind(&request.scope).bind(&request.nonce).bind(request.code_challenge.as_deref().ok_or_else(||crate::ApiError::bad("invalid_request"))?).execute(&mut *tx).await?;
+        if changed.rows_affected() != 1 {
+            return Err(crate::ApiError::unauthorized());
+        }
+        redirect(approved.redirect, request.state.as_deref(), "code", &code)
+    } else {
+        redirect(
+            approved.redirect,
+            request.state.as_deref(),
+            "error",
+            "access_denied",
+        )
+    };
+    sqlx::query("UPDATE oauth_consent_requests SET consumed_at=now() WHERE id=$1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
     Ok(response)
 }

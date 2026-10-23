@@ -60,9 +60,11 @@ jobs:
           umask 077
           openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$RUNNER_TEMP/signing.pem"
           openssl req -x509 -newkey rsa:2048 -nodes -keyout "$RUNNER_TEMP/tls.key" -out "$RUNNER_TEMP/tls.crt" -subj /CN=localhost -days 1
-          echo "SIGNING_KEY_FILE=$RUNNER_TEMP/signing.pem" >> "$GITHUB_ENV"
-          echo "TLS_CERT_FILE=$RUNNER_TEMP/tls.crt" >> "$GITHUB_ENV"
-          echo "TLS_KEY_FILE=$RUNNER_TEMP/tls.key" >> "$GITHUB_ENV"
+          {
+            echo "SIGNING_KEY_FILE=$RUNNER_TEMP/signing.pem"
+            echo "TLS_CERT_FILE=$RUNNER_TEMP/tls.crt"
+            echo "TLS_KEY_FILE=$RUNNER_TEMP/tls.key"
+          } >> "$GITHUB_ENV"
           for key in MFA_ENCRYPTION_KEY DELIVERY_ENCRYPTION_KEY GATEWAY_INTERNAL_TOKEN PROFILE_INTERNAL_TOKEN NOTIFICATION_INTERNAL_TOKEN ADMIN_INTERNAL_TOKEN; do
             case "$key" in
               *_ENCRYPTION_KEY) value=$(openssl rand -base64 32) ;;

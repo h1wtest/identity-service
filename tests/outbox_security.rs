@@ -242,7 +242,7 @@ async fn relay_publishes_canonical_key_trace_and_aggregate_order_to_real_kafka()
         .unwrap();
     let partition = client
         .partition_client(
-            "identity.events.v1",
+            "identity.events.v2",
             partition_for(aggregate),
             UnknownTopicHandling::Error,
         )
@@ -286,7 +286,7 @@ async fn relay_publishes_canonical_key_trace_and_aggregate_order_to_real_kafka()
                 if record.record.key.as_deref() != Some(aggregate.to_string().as_bytes()) {
                     continue;
                 }
-                let event: platform_contracts::Envelope =
+                let event: platform_contracts::eventsv2::Envelope =
                     serde_json::from_slice(record.record.value.as_ref().unwrap()).unwrap();
                 assert_eq!(
                     record.record.headers.get("traceparent").unwrap(),
@@ -327,4 +327,48 @@ async fn sql_boundary_rejects_plaintext_delivery_commands() {
     .fetch_one(&pool)
     .await
     .unwrap());
+}
+
+#[tokio::test]
+#[ignore = "requires real TLS/SCRAM broker; KAFKA_V2_ONLY_USERNAME/PASSWORD principal has Describe+Write only on identity.events.v2 and notification.commands.v2"]
+async fn current_only_kafka_principal_connects_and_publishes_without_legacy_metadata() {
+    let mut config = identity_service::config::Config::from_env().unwrap();
+    config.kafka_sasl_username = std::env::var("KAFKA_V2_ONLY_USERNAME")
+        .expect("restricted current-only SCRAM principal required");
+    config.kafka_sasl_password = std::env::var("KAFKA_V2_ONLY_PASSWORD")
+        .expect("restricted current-only SCRAM password required");
+    let client = identity_service::adapters::kafka::client(&config)
+        .await
+        .unwrap();
+    let topics = client.list_topics().await.unwrap();
+    assert!(
+        !topics
+            .iter()
+            .any(|t| t.name == "identity.events.v1" || t.name == "notification.commands.v1"),
+        "fixture must not grant retained-v1 metadata visibility"
+    );
+    let publisher = identity_service::adapters::kafka::KafkaPublisher::connect(&config)
+        .await
+        .unwrap();
+    let id = Uuid::now_v7();
+    let user = Uuid::now_v7();
+    let event = platform_contracts::eventsv2::Envelope {
+        schema_version: 2,
+        event_id: id,
+        event_type: "identity.email_verified".into(),
+        producer: "identity".into(),
+        aggregate_type: "user".into(),
+        aggregate_id: user,
+        aggregate_version: 1,
+        occurred_at: chrono::Utc::now(),
+        correlation_id: None,
+        causation_id: None,
+        traceparent: None,
+        payload: Some(serde_json::json!({"user_id":user})),
+        encrypted_payload: None,
+    };
+    publisher
+        .publish_v2("identity.events.v2", &event)
+        .await
+        .unwrap();
 }

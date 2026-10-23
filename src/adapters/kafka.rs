@@ -2,7 +2,7 @@ use crate::{
     config::Config,
     domain::events::{partition_for, Publisher},
 };
-use platform_contracts::{Envelope, COMMAND_TOPIC, IDENTITY_TOPIC, PARTITIONS};
+use platform_contracts::{Envelope, PARTITIONS};
 use rskafka::{
     client::{
         partition::{Compression, UnknownTopicHandling},
@@ -55,7 +55,9 @@ impl KafkaPublisher {
     pub async fn connect(config: &Config) -> anyhow::Result<Self> {
         let client = client(config).await?;
         let topics = client.list_topics().await?;
-        for name in [IDENTITY_TOPIC, COMMAND_TOPIC] {
+        // New producers require only current topics. Retained-v1 rows validate
+        // their original topic and authorization when actually published.
+        for name in ["identity.events.v2", "notification.commands.v2"] {
             let topic = topics
                 .iter()
                 .find(|topic| topic.name == name)
@@ -67,6 +69,37 @@ impl KafkaPublisher {
             }
         }
         Ok(Self { client })
+    }
+    pub async fn publish_v2(
+        &self,
+        topic: &str,
+        event: &platform_contracts::eventsv2::Envelope,
+    ) -> anyhow::Result<()> {
+        event.validate().map_err(anyhow::Error::msg)?;
+        if event.topic().map_err(anyhow::Error::msg)? != topic {
+            anyhow::bail!("stored envelope topic mismatch")
+        }
+        let mut headers = BTreeMap::new();
+        headers.insert("event_id".into(), event.event_id.to_string().into_bytes());
+        if let Some(trace) = &event.traceparent {
+            headers.insert("traceparent".into(), trace.as_bytes().to_vec());
+        }
+        let record = Record {
+            key: Some(event.aggregate_id.to_string().into_bytes()),
+            value: Some(serde_json::to_vec(event)?),
+            headers,
+            timestamp: event.occurred_at,
+        };
+        self.client
+            .partition_client(
+                topic,
+                partition_for(event.aggregate_id),
+                UnknownTopicHandling::Error,
+            )
+            .await?
+            .produce(vec![record], Compression::NoCompression)
+            .await?;
+        Ok(())
     }
 }
 

@@ -159,8 +159,8 @@ impl<'a> OAuth<'a> {
         }
         let hash = digest(code);
         let mut tx = self.store.begin().await?;
-        // Lookup identity without a row lock. Every mutation then acquires user
-        // and session before code/family, matching refresh and admin operations.
+        tx.lock_client(client).await?;
+        // Mutation lock order: client -> user -> session -> code/family/refresh.
         let subject = tx.code_subject(&hash).await?.ok_or(Error::InvalidGrant)?;
         let live = tx.lock_session(subject).await?;
         let code = tx.lock_code(&hash).await?.ok_or(Error::InvalidGrant)?;
@@ -212,6 +212,7 @@ impl<'a> OAuth<'a> {
         }
         let hash = digest(token);
         let mut tx = self.store.begin().await?;
+        tx.lock_client(client).await?;
         let identity = tx
             .refresh_identity(&hash)
             .await?
@@ -264,6 +265,7 @@ impl<'a> OAuth<'a> {
             iat: now.timestamp() as usize,
             token_use: "access".to_owned(),
             scope: family.scope.clone(),
+            grant_id: Some(family.id),
             nonce: None,
             email: None,
             email_verified: None,
@@ -271,6 +273,7 @@ impl<'a> OAuth<'a> {
         let access_token = self.crypto.sign(&claims).map_err(|_| Error::Dependency)?;
         let id = Claims {
             token_use: "id".to_owned(),
+            grant_id: None,
             nonce: family.nonce.clone(),
             email: has_scope(&family.scope, "email").then(|| session.email.clone()),
             email_verified: has_scope(&family.scope, "email").then_some(session.email_verified),

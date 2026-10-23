@@ -61,6 +61,7 @@ fn claims(config: &Config) -> Claims {
         iat: now,
         token_use: "access".into(),
         scope: "platform:api".into(),
+        grant_id: None,
         nonce: None,
         email: None,
         email_verified: None,

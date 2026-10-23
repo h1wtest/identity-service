@@ -21,7 +21,11 @@ pub mod config;
 pub mod domain;
 pub mod events;
 pub mod oauth;
+pub mod oauth_admin;
+pub mod oauth_grants;
 pub mod outbox;
+pub mod rbac;
+pub mod referral;
 pub mod rekey;
 pub mod security;
 pub mod telemetry;
@@ -182,11 +186,13 @@ pub fn create_router(state: AppState) -> Router {
         .with_state(state.clone())
         .merge(auth::router(state.clone()))
         .merge(oauth::router(state.clone()))
+        .merge(rbac::router(state.clone()))
+        .merge(oauth_admin::router(state.clone()))
         .layer(axum::extract::DefaultBodyLimit::max(16384))
         .layer(middleware::from_fn_with_state(state, observe))
 }
 async fn schema_ready(state: &AppState) -> bool {
-    let result=sqlx::query_scalar::<_,bool>("SELECT EXISTS(SELECT 1 FROM _sqlx_migrations WHERE version=7 AND success) AND to_regclass('identity_challenges') IS NOT NULL AND to_regclass('oauth_refresh_tokens') IS NOT NULL AND EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name='outbox_events' AND column_name='lease_token') AND EXISTS(SELECT 1 FROM pg_constraint WHERE conname='mfa_secret_encrypted' AND conrelid='mfa_secrets'::regclass AND convalidated) AND NOT EXISTS(SELECT 1 FROM mfa_secrets WHERE secret_key NOT LIKE 'enc:%')").fetch_one(&state.db).await;
+    let result=sqlx::query_scalar::<_,bool>("SELECT EXISTS(SELECT 1 FROM _sqlx_migrations WHERE version=9 AND success) AND to_regclass('oauth_consents') IS NOT NULL AND to_regclass('identity_admin_audit') IS NOT NULL AND EXISTS(SELECT 1 FROM pg_constraint WHERE conname='mfa_secret_encrypted' AND conrelid='mfa_secrets'::regclass AND convalidated) AND NOT EXISTS(SELECT 1 FROM mfa_secrets WHERE secret_key NOT LIKE 'enc:%')").fetch_one(&state.db).await;
     result.unwrap_or(false)
 }
 async fn ready(State(state): State<AppState>) -> Response {
@@ -226,6 +232,16 @@ async fn observe(State(state): State<AppState>, mut request: Request, next: Next
         .and_then(|value| value.to_str().ok())
         .map(|value| security::constant_eq(value, &state.config.gateway_internal_token))
         .unwrap_or(false);
+    // Listing devices must not manufacture activity. Successful real authenticated
+    // traffic touches at most once per minute, including domain introspection.
+    if request.uri().path() != "/api/v1/auth/sessions"
+        && !request.uri().path().starts_with("/health/")
+        && request.uri().path() != "/metrics"
+    {
+        if let Ok(actor) = auth::authenticate(&state, request.headers()).await {
+            let _=sqlx::query("UPDATE sessions SET last_active_at=now() WHERE id=$1 AND last_active_at<=now()-interval '60 seconds'").bind(actor.session_id).execute(&state.db).await;
+        }
+    }
     request.headers_mut().remove("x-gateway-token");
     if !trusted_gateway {
         let peer = request

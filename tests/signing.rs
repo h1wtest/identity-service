@@ -19,6 +19,7 @@ fn ring_validated_key_publishes_only_public_jwks_that_verifies_rs256_signature()
         iat: now,
         token_use: "access".into(),
         scope: "platform:api".into(),
+        grant_id: None,
         nonce: None,
         email: None,
         email_verified: None,

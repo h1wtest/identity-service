@@ -1193,6 +1193,7 @@ dependencies = [
  "platform-contracts",
  "prometheus",
  "rand 0.8.8",
+ "reqwest",
  "ring",
  "rskafka",
  "rustls",

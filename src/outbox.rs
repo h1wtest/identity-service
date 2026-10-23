@@ -100,18 +100,6 @@ pub async fn run(state: AppState) {
                 continue;
             }
         };
-        let envelope: Envelope = match serde_json::from_value::<Envelope>(event.payload.clone()) {
-            Ok(envelope)
-                if envelope.event_id == event.id && envelope.aggregate_id == event.aggregate_id =>
-            {
-                envelope
-            }
-            _ => {
-                let _ = retry(&state.db, &event).await;
-                tracing::error!(event_id=%event.id,"outbox stored contract invalid");
-                continue;
-            }
-        };
         let span = tracing::info_span!("outbox.publish", event_id=%event.id, aggregate_id=%event.aggregate_id, traceparent=event.payload.get("traceparent").and_then(serde_json::Value::as_str).unwrap_or(""));
         if let Some(parent) = event.payload.get("traceparent").and_then(Value::as_str) {
             crate::telemetry::attach_traceparent(&span, parent);
@@ -120,13 +108,25 @@ pub async fn run(state: AppState) {
             use tracing::Instrument;
             // Total network budget is below the lease. Dropping the timed-out future
             // cancels local retries; ambiguous broker acknowledgement remains at-least-once.
-            tokio::time::timeout(
-                PUBLISH_TIMEOUT,
-                client
-                    .as_ref()
-                    .expect("connected publisher")
-                    .publish(&event.topic, &envelope),
-            )
+            tokio::time::timeout(PUBLISH_TIMEOUT, async {
+                let publisher = client.as_ref().expect("connected publisher");
+                if event.payload.get("schema_version").and_then(Value::as_i64) == Some(2) {
+                    let envelope: platform_contracts::eventsv2::Envelope =
+                        serde_json::from_value(event.payload.clone())?;
+                    if envelope.event_id != event.id || envelope.aggregate_id != event.aggregate_id
+                    {
+                        anyhow::bail!("outbox identity mismatch")
+                    }
+                    publisher.publish_v2(&event.topic, &envelope).await
+                } else {
+                    let envelope: Envelope = serde_json::from_value(event.payload.clone())?;
+                    if envelope.event_id != event.id || envelope.aggregate_id != event.aggregate_id
+                    {
+                        anyhow::bail!("outbox identity mismatch")
+                    }
+                    publisher.publish(&event.topic, &envelope).await
+                }
+            })
             .instrument(span)
             .await
         };

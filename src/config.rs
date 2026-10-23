@@ -24,6 +24,13 @@ pub struct Config {
     pub notification_internal_token: String,
     pub admin_internal_token: String,
     pub gateway_internal_token: String,
+    pub catalog_internal_token: String,
+    pub billing_internal_token: String,
+    pub subscription_internal_token: String,
+    pub referral_internal_token: String,
+    pub identity_internal_token: String,
+    pub referral_url: String,
+    pub internal_ca_file: String,
 }
 impl Config {
     pub fn from_env() -> Result<Self> {
@@ -63,6 +70,41 @@ impl Config {
         let profile_internal_token = required("PROFILE_INTERNAL_TOKEN")?;
         let notification_internal_token = required("NOTIFICATION_INTERNAL_TOKEN")?;
         let admin_internal_token = required("ADMIN_INTERNAL_TOKEN")?;
+        let optional = |name: &str| std::env::var(name).unwrap_or_default();
+        let catalog_internal_token = optional("CATALOG_INTERNAL_TOKEN");
+        let billing_internal_token = optional("BILLING_INTERNAL_TOKEN");
+        let subscription_internal_token = optional("SUBSCRIPTION_INTERNAL_TOKEN");
+        let referral_internal_token = optional("REFERRAL_INTERNAL_TOKEN");
+        let identity_internal_token = optional("IDENTITY_INTERNAL_TOKEN");
+        let all_tokens = [
+            &profile_internal_token,
+            &notification_internal_token,
+            &admin_internal_token,
+            &catalog_internal_token,
+            &billing_internal_token,
+            &subscription_internal_token,
+            &referral_internal_token,
+            &identity_internal_token,
+        ];
+        for (i, token) in all_tokens.iter().enumerate() {
+            if !token.is_empty() && (token.len() < 32 || all_tokens[..i].contains(token)) {
+                bail!("service credentials must be distinct and at least 32 characters")
+            }
+        }
+        let referral_url = optional("REFERRAL_URL");
+        if !referral_url.is_empty() {
+            let parsed = url::Url::parse(&referral_url)?;
+            if parsed.scheme() != "https"
+                || parsed.host_str().is_none()
+                || !parsed.username().is_empty()
+                || parsed.password().is_some()
+                || parsed.query().is_some()
+                || parsed.fragment().is_some()
+                || parsed.path() != "/"
+            {
+                bail!("REFERRAL_URL must be an HTTPS origin")
+            }
+        }
         for token in [
             &profile_internal_token,
             &notification_internal_token,
@@ -86,6 +128,7 @@ impl Config {
                 &admin_internal_token,
             ]
             .contains(&&gateway_internal_token)
+            || all_tokens.contains(&&gateway_internal_token)
         {
             bail!("gateway credential must be distinct and at least 32 characters");
         }
@@ -117,6 +160,13 @@ impl Config {
             notification_internal_token,
             admin_internal_token,
             gateway_internal_token,
+            catalog_internal_token,
+            billing_internal_token,
+            subscription_internal_token,
+            referral_internal_token,
+            identity_internal_token,
+            referral_url,
+            internal_ca_file: optional("INTERNAL_CA_FILE"),
         })
     }
 }

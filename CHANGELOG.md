@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased — generic identity authority (2026-10-24)
+
+- Append migration0008 for OWNER/ADMIN/SUPPORT, intrinsic own-resource policy, persisted/versioned roles, serialized final-owner protection and secret-free audit/command recovery.
+- Replace bootstrap-admin with bootstrap-owner/OWNER_EMAIL/OWNER_PASSWORD, refusing silent elevation and preserving passwords; configure exact bundled callback from PUBLIC_ORIGIN.
+- Add OWNER OAuth clients/one-time hashed secrets/rotation/revocation and durable same-session third-party consent, retaining PKCE/code/refresh replay behavior.
+- Add scoped live v2 introspection, eligibility/backfill/notification-policy, safe ordinary-user revoke, current-first device metadata/expiry, rate-limited activity and revoke-others/OAuth-family cascade.
+- Add locale/referral preparation only for supplied codes and typed v2 events with explicit retained-v1 drain. Add behavioral PostgreSQL/HTTP/race regressions; integration verification remains required.
+- Review corrections: one-snapshot role/version reads; actor-specific staff revocation hierarchy; sanitized asynchronous identity admin-action outbox projection; local per-client OAuth revoke/rotation fences; one DB registration occurrence/deadline across event/backfill. Append migration0009 instead of altering applied0008 and align client-name200 boundary. Add real PostgreSQL lock-barrier/atomic audit regressions; parent re-verifies.
+- Correct actual least-privilege Kafka startup: current-only identity producer metadata requires only v2 topics; retained-v1 metadata/authorization is checked only for actual legacy drain publication. Add restricted TLS/SCRAM principal regression without expanding legacy ACL.
+- Permit the existing admin notification frontdoor only exact notifications:read/templates:write/replay workload scopes; retain current actor/fresh MFA and notification-owner revalidation, deny unrelated business/profile write admission. Add scoped router regression.
+- Complete S03 own connected-application grants: bounded paginated own list and CSRF-protected idempotent revoke, removing own consent/codes/families only. Bind OAuth access/userinfo to signed live grant_id; cleanly reject pre-cutover unbound access without legacy shims. Fence stale consent issuance and preserve platform sessions on already-revoked grant replay. Parent observed real RED404 before implementation; full PostgreSQL/browser GREEN pending.
+- Allow profile-owned quarantine revalidation exact notifications:read/replay alongside existing binding reset; reject profile template publishing/unrelated billing and preserve fresh actor MFA. Extend existing PostgreSQL scope regression after actual A03 quarantine403 reproduction.
+
 ## Unreleased — platform remediation (2026-10-23)
 
 ### Security and behavior

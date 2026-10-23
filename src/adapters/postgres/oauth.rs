@@ -26,7 +26,7 @@ struct PgGrantTransaction {
 #[async_trait]
 impl GrantStore for PgGrantStore {
     async fn client(&self, id: &str) -> Result<Option<Client>> {
-        let row = sqlx::query("SELECT client_id,client_secret_hash,redirect_uris,allowed_scopes,is_public FROM oauth_clients WHERE client_id=$1")
+        let row = sqlx::query("SELECT client_id,client_secret_hash,redirect_uris,allowed_scopes,is_public FROM oauth_clients WHERE client_id=$1 AND revoked_at IS NULL")
             .bind(id).fetch_optional(&self.db).await.map_err(dependency)?;
         row.map(|row| {
             Ok(Client {
@@ -40,10 +40,32 @@ impl GrantStore for PgGrantStore {
         .transpose()
     }
     async fn create_code(&self, code: &NewCode) -> Result<bool> {
-        let changed = sqlx::query("INSERT INTO oauth_authorization_codes(code_hash,client_id,session_id,user_id,redirect_uri,scope,nonce,code_challenge,expires_at) SELECT $1,$2,s.id,s.user_id,$5,$6,$7,$8,LEAST($9,s.expires_at) FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.id=$3 AND s.user_id=$4 AND s.is_active AND s.expires_at>NOW() AND NOT u.is_banned")
+        let mut tx = self.db.begin().await.map_err(dependency)?;
+        let live:Option<String>=sqlx::query_scalar("SELECT client_id FROM oauth_clients WHERE client_id=$1 AND revoked_at IS NULL FOR UPDATE").bind(&code.client_id).fetch_optional(&mut *tx).await.map_err(dependency)?;
+        if live.is_none() {
+            return Ok(false);
+        }
+        sqlx::query("SELECT id FROM users WHERE id=$1 FOR UPDATE")
+            .bind(code.subject.user_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(dependency)?;
+        sqlx::query("SELECT id FROM sessions WHERE id=$1 AND user_id=$2 FOR UPDATE")
+            .bind(code.subject.session_id)
+            .bind(code.subject.user_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(dependency)?;
+        let scopes: Vec<String> = code.scope.split_whitespace().map(str::to_owned).collect();
+        let consent:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM oauth_clients c WHERE c.client_id=$1 AND c.revoked_at IS NULL AND (c.trusted_first_party OR EXISTS(SELECT 1 FROM oauth_consents g WHERE g.user_id=$2 AND g.client_id=c.client_id AND g.scopes @> $3)))").bind(&code.client_id).bind(code.subject.user_id).bind(scopes).fetch_one(&mut *tx).await.map_err(dependency)?;
+        if !consent {
+            return Ok(false);
+        }
+        let changed = sqlx::query("INSERT INTO oauth_authorization_codes(code_hash,client_id,session_id,user_id,redirect_uri,scope,nonce,code_challenge,expires_at) SELECT $1,$2,s.id,s.user_id,$5,$6,$7,$8,LEAST($9,s.expires_at) FROM sessions s JOIN users u ON u.id=s.user_id JOIN oauth_clients c ON c.client_id=$2 AND c.revoked_at IS NULL WHERE s.id=$3 AND s.user_id=$4 AND s.is_active AND s.expires_at>NOW() AND NOT u.is_banned")
             .bind(&code.hash).bind(&code.client_id).bind(code.subject.session_id).bind(code.subject.user_id)
             .bind(&code.redirect_uri).bind(&code.scope).bind(&code.nonce).bind(&code.challenge).bind(code.expires_at)
-            .execute(&self.db).await.map_err(dependency)?;
+            .execute(&mut *tx).await.map_err(dependency)?;
+        tx.commit().await.map_err(dependency)?;
         Ok(changed.rows_affected() == 1)
     }
     async fn begin(&self) -> Result<Box<dyn GrantTransaction>> {
@@ -56,6 +78,21 @@ impl GrantStore for PgGrantStore {
 
 #[async_trait]
 impl GrantTransaction for PgGrantTransaction {
+    async fn lock_client(&mut self, client: &Client) -> Result<()> {
+        let current=sqlx::query("SELECT client_secret_hash,is_public FROM oauth_clients WHERE client_id=$1 AND revoked_at IS NULL FOR UPDATE").bind(&client.client_id).fetch_optional(&mut *self.tx).await.map_err(dependency)?.ok_or(Error::InvalidClient)?;
+        if current
+            .try_get::<Option<String>, _>("client_secret_hash")
+            .map_err(dependency)?
+            != client.secret_hash
+            || current
+                .try_get::<bool, _>("is_public")
+                .map_err(dependency)?
+                != client.is_public
+        {
+            return Err(Error::InvalidClient);
+        }
+        Ok(())
+    }
     async fn code_subject(&mut self, hash: &str) -> Result<Option<Subject>> {
         let row = sqlx::query(
             "SELECT user_id,session_id FROM oauth_authorization_codes WHERE code_hash=$1",
@@ -209,6 +246,16 @@ impl GrantTransaction for PgGrantTransaction {
         family_id: Uuid,
         reason: &'static str,
     ) -> Result<()> {
+        let revocation: Option<String> = sqlx::query_scalar(
+            "SELECT revoked_reason FROM oauth_token_families WHERE id=$1 FOR UPDATE",
+        )
+        .bind(family_id)
+        .fetch_one(&mut *self.tx)
+        .await
+        .map_err(dependency)?;
+        if revocation.as_deref() == Some("user_grant_revoked") {
+            return Ok(());
+        }
         sqlx::query("UPDATE oauth_token_families SET revoked_at=COALESCE(revoked_at,NOW()),revoked_reason=$2 WHERE id=$1")
             .bind(family_id).bind(reason).execute(&mut *self.tx).await.map_err(dependency)?;
         let user: Option<Uuid> = sqlx::query_scalar("UPDATE sessions SET is_active=false,revoked_reason=$2 WHERE id=$1 AND is_active RETURNING user_id")

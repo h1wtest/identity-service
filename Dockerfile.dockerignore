@@ -11,3 +11,17 @@
 **/*.pem
 **/*.key
 **/*.crt
+**/.generic-local
+**/.generic-local/**
+**/.local
+**/.local/**
+**/*.p12
+**/*.pfx
+**/node_modules
+**/dist
+**/bin
+**/.venv
+**/__pycache__
+**/*.pyc
+**/*.test
+**/coverage*

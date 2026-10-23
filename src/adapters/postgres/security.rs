@@ -35,8 +35,11 @@ impl SecurityTransaction for PostgresSecurityTransaction<'_, '_> {
         }))
     }
     async fn permission(&mut self, user_id: Uuid, permission: &str) -> ApiResult<bool> {
-        Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM user_roles ur JOIN role_permissions rp ON rp.role_id=ur.role_id JOIN permissions p ON p.id=rp.permission_id JOIN mfa_secrets m ON m.user_id=ur.user_id AND m.is_enabled WHERE ur.user_id=$1 AND p.slug=$2 AND (ur.expires_at IS NULL OR ur.expires_at>now()))")
-            .bind(user_id).bind(permission).fetch_one(&mut **self.transaction).await?)
+        if !crate::rbac::PERMISSIONS.contains(&permission) {
+            return Ok(false);
+        }
+        Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM user_roles ur JOIN roles r ON r.id=ur.role_id JOIN role_permissions rp ON rp.role_id=ur.role_id JOIN permissions p ON p.id=rp.permission_id JOIN mfa_secrets m ON m.user_id=ur.user_id AND m.is_enabled WHERE ur.user_id=$1 AND p.slug=$2 AND (NOT $3 OR r.slug='owner') AND (ur.expires_at IS NULL OR ur.expires_at>now()))")
+            .bind(user_id).bind(permission).bind(crate::rbac::owner_only(permission)).fetch_one(&mut **self.transaction).await?)
     }
     async fn replace_password(
         &mut self,
@@ -57,6 +60,7 @@ impl SecurityTransaction for PostgresSecurityTransaction<'_, '_> {
             .bind(user_id)
             .fetch_optional(&mut **self.transaction)
             .await?;
+        sqlx::query("UPDATE oauth_token_families SET revoked_at=COALESCE(revoked_at,now()),revoked_reason=$3 WHERE user_id=$1 AND ($2::uuid IS NULL OR session_id=$2) AND revoked_at IS NULL").bind(user_id).bind(session_id).bind(reason).execute(&mut **self.transaction).await?;
         Ok(sqlx::query_scalar("UPDATE sessions SET is_active=false,revoked_reason=$3 WHERE user_id=$1 AND is_active AND ($2::uuid IS NULL OR id=$2) RETURNING id")
             .bind(user_id).bind(session_id).bind(reason).fetch_all(&mut **self.transaction).await?)
     }

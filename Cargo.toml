@@ -43,3 +43,4 @@ thiserror = "2.0"
 anyhow = "1.0"
 dotenvy = "0.15"
 platform-contracts = { path = "../platform-contracts/rust" }
+reqwest = { version = "=0.13.1", default-features = false, features = ["rustls"] }

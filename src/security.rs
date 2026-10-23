@@ -78,6 +78,8 @@ pub struct Claims {
     pub iat: usize,
     pub token_use: String,
     pub scope: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant_id: Option<Uuid>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nonce: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

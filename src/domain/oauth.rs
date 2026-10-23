@@ -206,6 +206,7 @@ pub trait GrantStore: Send + Sync {
 }
 #[async_trait]
 pub trait GrantTransaction: Send {
+    async fn lock_client(&mut self, client: &Client) -> Result<()>;
     async fn code_subject(&mut self, hash: &str) -> Result<Option<Subject>>;
     async fn refresh_identity(&mut self, hash: &str) -> Result<Option<RefreshIdentity>>;
     async fn lock_session(&mut self, subject: Subject) -> Result<Option<LiveSession>>;

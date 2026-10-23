@@ -67,11 +67,8 @@ async fn authenticate_for(
             .ok_or_else(ApiError::unauthorized)?;
         let claims = state.crypto.verify(token)?;
         if oidc_userinfo {
-            let client: bool =
-                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM oauth_clients WHERE client_id=$1)")
-                    .bind(&claims.aud)
-                    .fetch_one(&state.db)
-                    .await?;
+            let grant_id = claims.grant_id.ok_or_else(ApiError::unauthorized)?;
+            let client:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM oauth_token_families f JOIN oauth_clients c ON c.client_id=f.client_id WHERE f.id=$1 AND f.client_id=$2 AND f.user_id=$3 AND f.session_id=$4 AND f.revoked_at IS NULL AND f.expires_at>now() AND c.revoked_at IS NULL)").bind(grant_id).bind(&claims.aud).bind(claims.sub).bind(claims.sid).fetch_one(&state.db).await?;
             if !client
                 || !claims
                     .scope
@@ -98,7 +95,12 @@ async fn authenticate_for(
     let user_id: Uuid = row.get("id");
     let session_id: Uuid = row.get("sid");
     let roles:Vec<String>=sqlx::query_scalar("SELECT r.slug FROM user_roles ur JOIN roles r ON r.id=ur.role_id WHERE ur.user_id=$1 AND (ur.expires_at IS NULL OR ur.expires_at>now()) ORDER BY r.slug").bind(user_id).fetch_all(&state.db).await?;
-    let permissions:Vec<String>=sqlx::query_scalar("SELECT DISTINCT p.slug FROM user_roles ur JOIN role_permissions rp ON rp.role_id=ur.role_id JOIN permissions p ON p.id=rp.permission_id WHERE ur.user_id=$1 AND (ur.expires_at IS NULL OR ur.expires_at>now()) ORDER BY p.slug").bind(user_id).fetch_all(&state.db).await?;
+    let mut permissions:Vec<String>=sqlx::query_scalar("SELECT DISTINCT p.slug FROM user_roles ur JOIN role_permissions rp ON rp.role_id=ur.role_id JOIN permissions p ON p.id=rp.permission_id WHERE ur.user_id=$1 AND (ur.expires_at IS NULL OR ur.expires_at>now()) ORDER BY p.slug").bind(user_id).fetch_all(&state.db).await?;
+    permissions.retain(|p| {
+        crate::rbac::PERMISSIONS.contains(&p.as_str())
+            && (!crate::rbac::owner_only(p) || roles.iter().any(|r| r == "owner"))
+    });
+    permissions.extend(crate::rbac::OWN_PERMISSIONS.iter().map(|p| p.to_string()));
     let mfa_verified = row.get::<bool, _>("mfa_verified")
         && row
             .get::<Option<DateTime<Utc>>, _>("mfa_verified_at")
@@ -116,7 +118,9 @@ async fn authenticate_for(
     })
 }
 pub fn require_permission(actor: &Actor, permission: &str) -> ApiResult<()> {
-    if !actor.mfa_enabled
+    if !crate::rbac::known_permission(permission)
+        || (crate::rbac::owner_only(permission) && !actor.roles.iter().any(|r| r == "owner"))
+        || !actor.mfa_enabled
         || !actor.mfa_verified
         || !actor.permissions.iter().any(|v| v == permission)
     {
@@ -141,7 +145,7 @@ pub fn csrf(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
     }
     Ok(())
 }
-async fn mutation(state: &AppState, headers: &HeaderMap) -> ApiResult<Actor> {
+pub(crate) async fn mutation(state: &AppState, headers: &HeaderMap) -> ApiResult<Actor> {
     if cookie(headers, "sso_session").is_none()
         && headers
             .get("authorization")
@@ -313,6 +317,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/auth/logout", post(logout))
         .route("/api/v1/auth/sessions", get(sessions).delete(revoke_all))
         .route("/api/v1/auth/sessions/{id}", delete(revoke))
+        .route("/api/v1/auth/sessions/revoke-others", post(revoke_others))
         .route("/api/v1/auth/reauth", post(mfa::reauth))
         .route("/api/v1/auth/mfa/setup", post(mfa::setup))
         .route("/api/v1/auth/mfa/enable", post(mfa::enable))
@@ -322,6 +327,39 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/auth/password/reset", post(password::reset))
         .route("/api/v1/auth/password/change", post(password::change))
         .route("/internal/v1/introspect", post(internal::introspect))
+        .route("/internal/v2/introspect", post(internal::introspect_v2))
+        .route("/internal/v2/users", get(internal::backfill))
+        .route(
+            "/internal/v2/users/{id}/eligibility",
+            get(internal::eligibility),
+        )
+        .route(
+            "/internal/v2/users/{id}/notification-flow",
+            get(internal::notification_flow),
+        )
+        .route("/internal/v2/admin/users", get(internal::users))
+        .route("/internal/v2/admin/users/{id}/ban", post(internal::ban_v2))
+        .route(
+            "/internal/v2/admin/users/{id}/unban",
+            post(internal::unban_v2),
+        )
+        .route(
+            "/internal/v2/admin/users/{id}/sessions/revoke",
+            post(internal::revoke_v2),
+        )
+        .route("/internal/v2/admin/users/{id}", get(internal::user_detail))
+        .route(
+            "/internal/v2/admin/commands/{id}",
+            get(internal::command_status),
+        )
+        .route(
+            "/internal/v2/notification-recipients",
+            get(internal::notification_recipients),
+        )
+        .route(
+            "/api/v1/admin/users/{id}/sessions/revoke",
+            post(internal::admin_revoke_public),
+        )
         .route("/internal/v1/admin/users", get(internal::users))
         .route("/internal/v1/admin/users/{id}/ban", post(internal::ban))
         .route("/internal/v1/admin/users/{id}/unban", post(internal::unban))
@@ -350,6 +388,8 @@ async fn get_csrf(State(state): State<AppState>, headers: HeaderMap) -> ApiResul
 struct Register {
     email: String,
     password: String,
+    locale: Option<String>,
+    referral_code: Option<String>,
 }
 async fn register(
     State(state): State<AppState>,
@@ -362,34 +402,49 @@ async fn register(
     rate(&state, "register-email", &email, 5).await?;
     let hash = hash_password(&state, body.password).await?;
     let id = Uuid::now_v7();
+    let registration_id = Uuid::now_v7();
+    let locale = body.locale.unwrap_or_else(|| {
+        if headers
+            .get("accept-language")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .starts_with("ru")
+        {
+            "ru".into()
+        } else {
+            "en".into()
+        }
+    });
+    if !["en", "ru"].contains(&locale.as_str()) {
+        return Err(ApiError::bad("invalid_locale"));
+    }
+    let referral_claim =
+        crate::referral::prepare(&state, id, registration_id, body.referral_code.as_deref())
+            .await?;
+    let referral_claim_id = referral_claim.as_ref().map(|(id, _)| *id);
     let code = format!("{:06}", rand::random::<u32>() % 1_000_000);
     let expires = Utc::now() + chrono::Duration::minutes(15);
     let mut tx = state.db.begin().await?;
     let result = sqlx::query(
-        "INSERT INTO users(id,email,password_hash) VALUES($1,$2,$3) ON CONFLICT(email) DO NOTHING",
+        "INSERT INTO users(id,email,password_hash,registration_id,registration_locale,referral_claim_id) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(email) DO NOTHING",
     )
     .bind(id)
     .bind(&email)
     .bind(hash)
+    .bind(registration_id).bind(&locale).bind(referral_claim_id)
     .execute(&mut *tx)
     .await?;
     if result.rows_affected() == 0 {
         return Err(ApiError::bad("registration_unavailable"));
     }
-    sqlx::query(
-        "INSERT INTO user_roles(user_id,role_id) SELECT $1,id FROM roles WHERE slug='user'",
-    )
-    .bind(id)
-    .execute(&mut *tx)
-    .await?;
     sqlx::query("INSERT INTO identity_challenges(id,user_id,kind,token_hash,expires_at) VALUES($1,$2,'verify_email',$3,$4)").bind(Uuid::new_v4()).bind(id).bind(digest(&format!("{id}:{code}"))).bind(expires).execute(&mut *tx).await?;
-    enqueue(
+    crate::events::enqueue_registration(
         &mut tx,
         &state.crypto,
-        "identity.user_registered",
         id,
-        json!({"user_id":id,"email":email}),
+        json!({"user_id":id,"email":email,"locale":locale,"registration_id":registration_id,"referral_claim_id":referral_claim_id}),
         trace(&headers),
+        referral_claim.as_ref().map(|(_,deadline)|*deadline),
     )
     .await?;
     enqueue(
@@ -397,7 +452,7 @@ async fn register(
         &state.crypto,
         "notification.email_verification",
         id,
-        json!({"user_id":id,"email":email,"code":code,"expires_at":expires}),
+        json!({"user_id":id,"email":email,"code":code,"expires_at":expires,"locale":locale}),
         trace(&headers),
     )
     .await?;
@@ -627,8 +682,13 @@ async fn logout(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<
 }
 async fn sessions(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Json<Value>> {
     let actor = authenticate(&state, &headers).await?;
-    let rows=sqlx::query("SELECT id,device_name,ip_address,user_agent,created_at,last_active_at FROM sessions WHERE user_id=$1 AND is_active AND expires_at>now() ORDER BY created_at DESC").bind(actor.user_id).fetch_all(&state.db).await?;
-    Ok(Json(Value::Array(rows.into_iter().map(|r|json!({"session_id":r.get::<Uuid,_>("id"),"device_name":r.get::<Option<String>,_>("device_name"),"ip_address":r.get::<String,_>("ip_address"),"user_agent":r.get::<String,_>("user_agent"),"created_at":r.get::<DateTime<Utc>,_>("created_at"),"last_active_at":r.get::<DateTime<Utc>,_>("last_active_at"),"is_current":r.get::<Uuid,_>("id")==actor.session_id})).collect())))
+    let rows=sqlx::query("SELECT id,device_name,ip_address,user_agent,created_at,expires_at,last_active_at FROM sessions WHERE user_id=$1 AND is_active AND expires_at>now() ORDER BY (id=$2) DESC,last_active_at DESC,id DESC").bind(actor.user_id).bind(actor.session_id).fetch_all(&state.db).await?;
+    Ok(Json(Value::Array(rows.into_iter().map(|r| {
+        let ua=r.get::<String,_>("user_agent");let (browser,os)=session_metadata(&ua);
+        let device=r.get::<Option<String>,_>("device_name").filter(|s|!s.trim().is_empty()).unwrap_or_else(||"unknown".into());
+        let label=if device!="unknown"{device.clone()}else if browser=="unknown"&&os=="unknown"{"unknown".into()}else{format!("{browser} / {os}")};
+        json!({"session_id":r.get::<Uuid,_>("id"),"device_name":device,"device_label":label,"browser":browser,"os":os,"ip_address":r.get::<String,_>("ip_address"),"user_agent":ua,"created_at":r.get::<DateTime<Utc>,_>("created_at"),"expires_at":r.get::<DateTime<Utc>,_>("expires_at"),"last_active_at":r.get::<DateTime<Utc>,_>("last_active_at"),"is_current":r.get::<Uuid,_>("id")==actor.session_id})
+    }).collect())))
 }
 async fn revoke(
     State(state): State<AppState>,
@@ -678,4 +738,61 @@ async fn revoke_all(State(state): State<AppState>, headers: HeaderMap) -> ApiRes
         "",
         0,
     ))
+}
+
+pub fn session_metadata(ua: &str) -> (&'static str, &'static str) {
+    let browser = if ua.contains("Edg/") {
+        "Edge"
+    } else if ua.contains("Firefox/") {
+        "Firefox"
+    } else if ua.contains("Chrome/") {
+        "Chrome"
+    } else if ua.contains("Safari/") {
+        "Safari"
+    } else {
+        "unknown"
+    };
+    let os = if ua.contains("Android") {
+        "Android"
+    } else if ua.contains("iPhone") || ua.contains("iPad") {
+        "iOS"
+    } else if ua.contains("Windows") {
+        "Windows"
+    } else if ua.contains("Mac OS") {
+        "macOS"
+    } else if ua.contains("Linux") {
+        "Linux"
+    } else {
+        "unknown"
+    };
+    (browser, os)
+}
+async fn revoke_others(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    let actor = mutation(&state, &headers).await?;
+    let mut tx = state.db.begin().await?;
+    lock_authorized_actor(&mut tx, &actor, false, None).await?;
+    let ids: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM sessions WHERE user_id=$1 AND id<>$2 AND is_active ORDER BY id",
+    )
+    .bind(actor.user_id)
+    .bind(actor.session_id)
+    .fetch_all(&mut *tx)
+    .await?;
+    let mut count = 0;
+    for id in ids {
+        count += revoke_tx(
+            &state,
+            &mut tx,
+            actor.user_id,
+            Some(id),
+            "user_revoked_others",
+            &headers,
+        )
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(Json(json!({"revoked":count})))
 }
