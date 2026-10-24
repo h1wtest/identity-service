@@ -12,6 +12,7 @@
 - Permit the existing admin notification frontdoor only exact notifications:read/templates:write/replay workload scopes; retain current actor/fresh MFA and notification-owner revalidation, deny unrelated business/profile write admission. Add scoped router regression.
 - Complete S03 own connected-application grants: bounded paginated own list and CSRF-protected idempotent revoke, removing own consent/codes/families only. Bind OAuth access/userinfo to signed live grant_id; cleanly reject pre-cutover unbound access without legacy shims. Fence stale consent issuance and preserve platform sessions on already-revoked grant replay. Parent observed real RED404 before implementation; full PostgreSQL/browser GREEN pending.
 - Allow profile-owned quarantine revalidation exact notifications:read/replay alongside existing binding reset; reject profile template publishing/unrelated billing and preserve fresh actor MFA. Extend existing PostgreSQL scope regression after actual A03 quarantine403 reproduction.
+- Correct SUPPORT own-command recovery: derive current permission from the persisted original operation, require original actor/fresh MFA even for terminal lookup, and authorize absent-command404 only for current allowed command actors. Preserve the admin workload boundary and do not add global audit permission. Add real PostgreSQL/router regressions for own recovery, foreign actor, permission revocation, stale MFA, CSRF and same-ID replay; parent integration owns verification.
 
 ## Unreleased — platform remediation (2026-10-23)
 

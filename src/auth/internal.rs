@@ -628,16 +628,36 @@ pub(super) async fn command_status(
 ) -> ApiResult<Json<Value>> {
     service(&s, &h, true)?;
     let a = authenticate(&s, &credentials(&h)?).await?;
-    require_permission(&a, "audit:read")?;
-    let result: Option<Value> = sqlx::query_scalar(
-        "SELECT result FROM identity_admin_commands WHERE command_id=$1 AND actor_user_id=$2",
+    let command = sqlx::query(
+        "SELECT actor_user_id,operation,result FROM identity_admin_commands WHERE command_id=$1",
     )
     .bind(id)
-    .bind(a.user_id)
     .fetch_optional(&s.db)
     .await?;
+    let Some(command) = command else {
+        // Absence is an authority decision used to resume a journaled command.
+        // Do not require unrelated audit access, or accept an arbitrary permission.
+        if require_permission(&a, "users:sessions:revoke").is_err() {
+            require_permission(&a, "users:write")?;
+        }
+        return Err(ApiError {
+            status: StatusCode::NOT_FOUND,
+            code: "command_not_found",
+        });
+    };
+    if command.get::<Uuid, _>("actor_user_id") != a.user_id {
+        return Err(ApiError::forbidden());
+    }
+    let operation: String = command.get("operation");
+    let permission = match operation.as_str() {
+        "revoke" => "users:sessions:revoke",
+        "ban" | "unban" => "users:write",
+        _ => return Err(ApiError::forbidden()),
+    };
+    require_permission(&a, permission)?;
+    let result: Value = command.get("result");
     Ok(Json(
-        json!({"command_id":id,"status":"succeeded","result":result.ok_or(ApiError{status:StatusCode::NOT_FOUND,code:"command_not_found"})?}),
+        json!({"command_id":id,"status":"succeeded","result":result}),
     ))
 }
 pub(super) async fn user_detail(

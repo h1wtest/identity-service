@@ -529,6 +529,202 @@ async fn admin_command_replay_is_durable_and_body_conflicts_do_not_repeat_events
 
 #[tokio::test]
 #[ignore = "requires disposable PostgreSQL and full identity configuration"]
+async fn support_command_status_uses_original_actor_action_current_permission_and_fresh_mfa() {
+    let s = state().await;
+    let support = user(&s, Some("support")).await;
+    let foreign = user(&s, Some("support")).await;
+    let ordinary = user(&s, None).await;
+    let command_id = Uuid::now_v7();
+    async fn owner_call(
+        s: &AppState,
+        u: &User,
+        token: &str,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+        csrf: bool,
+    ) -> (StatusCode, Value) {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("x-service-token", token)
+            .header(
+                "cookie",
+                format!("sso_session={}; sso_csrf={}", u.token, u.csrf),
+            );
+        if csrf {
+            request = request
+                .header("origin", &s.config.public_origin)
+                .header("x-csrf-token", &u.csrf);
+        }
+        let bytes = if let Some(body) = body {
+            request = request.header("content-type", "application/json");
+            body.to_string()
+        } else {
+            String::new()
+        };
+        let response = identity_service::create_router(s.clone())
+            .oneshot(request.body(Body::from(bytes)).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 16384).await.unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+    let path = format!("/internal/v2/admin/commands/{command_id}");
+    let admin = &s.config.admin_internal_token;
+    // An allowed SUPPORT actor can establish authoritative absence without audit:read.
+    let absent = owner_call(&s, &support, admin, "GET", &path, None, false).await;
+    assert_eq!(absent.0, StatusCode::NOT_FOUND, "{absent:?}");
+    assert_eq!(absent.1["code"], "command_not_found");
+    assert_eq!(
+        owner_call(&s, &ordinary, admin, "GET", &path, None, false)
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        owner_call(
+            &s,
+            &support,
+            &s.config.notification_internal_token,
+            "GET",
+            &path,
+            None,
+            false
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    let mutation_path = format!("/internal/v2/admin/users/{}/sessions/revoke", ordinary.id);
+    let body = json!({"reason":"support case","idempotency_key":command_id});
+    assert_eq!(
+        owner_call(
+            &s,
+            &support,
+            admin,
+            "POST",
+            &mutation_path,
+            Some(body.clone()),
+            false
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    let committed = owner_call(
+        &s,
+        &support,
+        admin,
+        "POST",
+        &mutation_path,
+        Some(body.clone()),
+        true,
+    )
+    .await;
+    assert_eq!(committed.0, StatusCode::OK, "{committed:?}");
+    assert_eq!(committed.1["revoked"], 1);
+    // Ignore the mutation response: recovery must use its persisted same UUID/result.
+    let recovered = owner_call(&s, &support, admin, "GET", &path, None, false).await;
+    assert_eq!(recovered.0, StatusCode::OK, "{recovered:?}");
+    assert_eq!(
+        recovered.1,
+        json!({"command_id":command_id,"status":"succeeded","result":{"revoked":1}})
+    );
+    assert_eq!(
+        owner_call(&s, &foreign, admin, "GET", &path, None, false)
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    let new_session = Uuid::now_v7();
+    sqlx::query("INSERT INTO sessions(id,user_id,ip_address,user_agent,expires_at) VALUES($1,$2,'127.0.0.1','new after commit',now()+interval '1 day')")
+        .bind(new_session).bind(ordinary.id).execute(&s.db).await.unwrap();
+    assert_eq!(
+        owner_call(
+            &s,
+            &support,
+            admin,
+            "POST",
+            &mutation_path,
+            Some(body),
+            true
+        )
+        .await,
+        committed
+    );
+    let active: bool = sqlx::query_scalar("SELECT is_active FROM sessions WHERE id=$1")
+        .bind(new_session)
+        .fetch_one(&s.db)
+        .await
+        .unwrap();
+    assert!(active, "same-key replay repeated revocation");
+    // Holding a different allowed command permission is not sufficient for stored ban.
+    let ban_id = Uuid::now_v7();
+    sqlx::query("INSERT INTO identity_admin_commands(command_id,actor_user_id,operation,target,request,result) VALUES($1,$2,'ban',$3,'{}','{}')")
+        .bind(ban_id).bind(support.id).bind(ordinary.id).execute(&s.db).await.unwrap();
+    assert_eq!(
+        owner_call(
+            &s,
+            &support,
+            admin,
+            "GET",
+            &format!("/internal/v2/admin/commands/{ban_id}"),
+            None,
+            false
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    sqlx::query("UPDATE sessions SET mfa_verified_at=now()-interval '16 minutes' WHERE id=$1")
+        .bind(support.sid)
+        .execute(&s.db)
+        .await
+        .unwrap();
+    assert_eq!(
+        owner_call(&s, &support, admin, "GET", &path, None, false)
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    let unknown = format!("/internal/v2/admin/commands/{}", Uuid::now_v7());
+    assert_eq!(
+        owner_call(&s, &support, admin, "GET", &unknown, None, false)
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    sqlx::query("UPDATE sessions SET mfa_verified_at=now() WHERE id=$1")
+        .bind(support.sid)
+        .execute(&s.db)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM user_roles WHERE user_id=$1")
+        .bind(support.id)
+        .execute(&s.db)
+        .await
+        .unwrap();
+    assert_eq!(
+        owner_call(&s, &support, admin, "GET", &path, None, false)
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        owner_call(&s, &support, admin, "GET", &unknown, None, false)
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL and full identity configuration"]
 async fn assignment_read_keeps_roles_and_expected_version_in_one_snapshot() {
     let s = state().await;
     let owner = user(&s, Some("owner")).await;
