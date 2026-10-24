@@ -10,7 +10,9 @@ openssl req -newkey rsa:2048 -nodes -keyout "$root/broker.key" -out "$root/broke
 printf 'subjectAltName=DNS:localhost,DNS:broker,IP:127.0.0.1\n' > "$root/extensions"
 openssl x509 -req -in "$root/broker.csr" -CA "$root/ca.crt" -CAkey "$root/ca.key" -CAcreateserial -out "$root/broker.crt" -days 1 -extfile "$root/extensions"
 password="$(openssl rand -hex 32)"
+current_password="$(openssl rand -hex 32)"
 if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then printf '::add-mask::%s\n' "$password"; fi
+if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then printf '::add-mask::%s\n' "$current_password"; fi
 cat > "$root/redpanda.yaml" <<'YAML'
 redpanda:
   data_directory: /var/lib/redpanda/data
@@ -45,7 +47,12 @@ if ! docker exec identity-ci-kafka rpk cluster health -X admin.hosts=localhost:9
   exit 1
 fi
 docker exec identity-ci-kafka rpk security user create identity --password "$password" --mechanism SCRAM-SHA-256 -X admin.hosts=localhost:9644
-for topic in identity.events.v1 notification.commands.v1 platform.dlq.v1; do
+for topic in identity.events.v1 notification.commands.v1 platform.dlq.v1 identity.events.v2 notification.commands.v2; do
   docker exec identity-ci-kafka rpk topic create "$topic" --partitions 6 -X brokers=localhost:29094 -X tls.enabled=true -X tls.ca=/tls/ca.crt -X user=identity -X "pass=$password" -X sasl.mechanism=SCRAM-SHA-256
 done
+docker exec identity-ci-kafka rpk security user create identity-current-only --password "$current_password" --mechanism SCRAM-SHA-256 -X admin.hosts=localhost:9644
+for topic in identity.events.v2 notification.commands.v2; do
+  docker exec identity-ci-kafka rpk security acl create --allow-principal User:identity-current-only --operation describe --operation write --topic "$topic" --resource-pattern-type literal -X brokers=localhost:29094 -X tls.enabled=true -X tls.ca=/tls/ca.crt -X user=identity -X "pass=$password" -X sasl.mechanism=SCRAM-SHA-256
+done
 printf 'KAFKA_BROKERS=localhost:29094\nKAFKA_TLS_CA_FILE=%s/ca.crt\nKAFKA_SASL_USERNAME=identity\nKAFKA_SASL_PASSWORD=%s\n' "$root" "$password" >> "$GITHUB_ENV"
+printf 'KAFKA_V2_ONLY_USERNAME=identity-current-only\nKAFKA_V2_ONLY_PASSWORD=%s\n' "$current_password" >> "$GITHUB_ENV"
